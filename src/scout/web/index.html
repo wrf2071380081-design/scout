@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scout console · 看得见的长文档 Agentic RAG</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --line: #e3e6ea;
+    --ink: #1b1f24;
+    --ink-2: #5b6470;
+    --ink-3: #8b949e;
+    --accent: #2f6feb;
+    --accent-soft: #eaf1fe;
+    --ok: #1a7f47;
+    --warn: #b8801a;
+    --bad: #c0392b;
+    --shadow: 0 1px 2px rgba(16,24,40,.05), 0 4px 12px rgba(16,24,40,.04);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+  }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .2px; }
+  .brand span { color: var(--accent); }
+  .chip {
+    font-size: 12px; color: var(--ink-2); background: #f0f2f5;
+    border-radius: 999px; padding: 3px 10px; border: 1px solid var(--line);
+  }
+  .chip.mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
+  .spacer { flex: 1; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    border: 0; background: var(--panel); color: var(--ink-2);
+    padding: 5px 12px; font-size: 12px; cursor: pointer;
+  }
+  .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+  main {
+    display: grid; grid-template-columns: 260px minmax(0,1fr) 320px;
+    gap: 14px; padding: 14px 20px 28px; align-items: start;
+  }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+  .card h3 {
+    margin: 0; padding: 11px 14px; font-size: 13px; font-weight: 650;
+    border-bottom: 1px solid var(--line); color: var(--ink);
+  }
+  .card .body { padding: 12px 14px; }
+
+  textarea, input[type=text] {
+    width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
+    font: inherit; color: var(--ink); background: #fff; resize: vertical;
+  }
+  textarea:focus, input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  .btn {
+    border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  .btn.ghost { background: #fff; color: var(--ink-2); border-color: var(--line); font-weight: 500; }
+  .btn:disabled { opacity: .55; cursor: default; }
+  .samples { display: flex; flex-direction: column; gap: 6px; }
+  .samples button {
+    text-align: left; border: 1px solid var(--line); background: #fff; border-radius: 8px;
+    padding: 7px 9px; font-size: 12px; color: var(--ink-2); cursor: pointer; line-height: 1.45;
+  }
+  .samples button:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* —— 链路透视 —— */
+  .stages { display: flex; gap: 6px; margin-bottom: 12px; }
+  .stage { flex: 1; min-width: 0; }
+  .stage .bar { height: 6px; border-radius: 999px; background: #eceff3; overflow: hidden; }
+  .stage .bar i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .stage .nm { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
+  .stage .ms { font-size: 11px; color: var(--ink-2); font-family: ui-monospace, monospace; }
+  .steps { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow: auto; }
+  .step {
+    display: grid; grid-template-columns: 74px minmax(0,1fr) 62px; gap: 8px; align-items: baseline;
+    padding: 5px 6px; border-radius: 6px; font-size: 12px;
+  }
+  .step:nth-child(odd) { background: #fafbfc; }
+  .step .k { color: var(--accent); font-weight: 600; }
+  .step .n { color: var(--ink-2); }
+  .step .o { color: var(--ink-3); font-size: 11px; word-break: break-all; }
+  .step .d { text-align: right; color: var(--ink-3); font-family: ui-monospace, monospace; font-size: 11px; }
+
+  .answer { white-space: pre-wrap; font-size: 14px; line-height: 1.75; }
+  .answer .cite { color: var(--accent); font-weight: 600; }
+  .verdict { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .verdict.pass { color: var(--ok); border-color: #bfe3ce; background: #eef8f2; }
+  .verdict.abstain, .verdict.regenerate { color: var(--warn); border-color: #f0dfb8; background: #fdf7e8; }
+
+  .ev { border-top: 1px solid var(--line); padding: 9px 0; }
+  .ev:first-child { border-top: 0; }
+  .ev .hd { display: flex; gap: 8px; align-items: baseline; font-size: 12px; }
+  .ev .src { font-weight: 600; }
+  .ev .sc { color: var(--ink-3); font-family: ui-monospace, monospace; }
+  .ev .tx { color: var(--ink-2); font-size: 12px; margin-top: 3px; line-height: 1.6; }
+
+  /* —— 审批台 —— */
+  .req { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  .req .top { display: flex; align-items: center; gap: 8px; }
+  .risk { font-size: 11px; padding: 2px 7px; border-radius: 999px; font-weight: 600; }
+  .risk.safe { color: var(--ok); background: #eef8f2; }
+  .risk.confirm { color: var(--warn); background: #fdf7e8; }
+  .risk.required { color: var(--bad); background: #fdecea; }
+  .req .tool { font-weight: 600; font-size: 13px; }
+  .req .why { color: var(--ink-2); font-size: 12px; margin: 6px 0; }
+  .req .args { font-family: ui-monospace, monospace; font-size: 11px; color: var(--ink-3); word-break: break-all; }
+
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .metric { background: #fafbfc; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
+  .metric b { display: block; font-size: 16px; font-family: ui-monospace, monospace; }
+  .metric span { font-size: 11px; color: var(--ink-3); }
+
+  .ablation td { padding: 3px 6px; font-size: 12px; border-bottom: 1px solid var(--line); }
+  .ablation td:last-child { text-align: right; font-family: ui-monospace, monospace; }
+  .pos { color: var(--ok); } .neg { color: var(--bad); } .zero { color: var(--ink-3); }
+
+  .empty { color: var(--ink-3); font-size: 12px; padding: 8px 0; }
+  .hint { color: var(--ink-3); font-size: 12px; }
+  @media (max-width: 1080px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">scout <span>console</span></div>
+  <span class="chip"><span class="dot"></span> 离线 · 无需 API key</span>
+  <span class="chip mono" id="chipCorpus">语料 —</span>
+  <span class="chip mono" id="chipModel">model —</span>
+  <div class="spacer"></div>
+  <div class="seg">
+    <button id="mPipeline" class="on">pipeline</button>
+    <button id="mMulti">multiagent</button>
+  </div>
+</header>
+
+<main>
+  <!-- 左：提问 -->
+  <section class="card">
+    <h3>提问</h3>
+    <div class="body">
+      <textarea id="q" rows="5" placeholder="对知识库提一个问题…"></textarea>
+      <div style="margin:10px 0; display:flex; gap:8px;">
+        <button class="btn" id="ask">提问</button>
+        <button class="btn ghost" id="clr">清空</button>
+      </div>
+      <div class="hint" style="margin-bottom:6px;">示例</div>
+      <div class="samples">
+        <button data-q="云计算标准体系结构包括哪几个部分？">云计算标准体系结构包括哪几个部分？</button>
+        <button data-q="到2027年云计算标准体系有什么量化目标？">到2027年云计算标准体系有什么量化目标？</button>
+        <button data-q="云计算和低空经济两份标准体系在划分方式上有什么不同？">云计算和低空经济两份标准在划分方式上有什么不同？（多智能体）</button>
+        <button data-q="把本周周报发给老板">把本周周报发给老板（触发人工审批）</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 中：链路透视 + 答案 + 证据 -->
+  <section>
+    <div class="card" style="margin-bottom:14px;">
+      <h3>链路透视 · Trace X-Ray</h3>
+      <div class="body">
+        <div class="stages" id="stages"></div>
+        <div class="steps" id="steps"><div class="empty">尚未提问。</div></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px;">
+      <h3>回答 <span id="verdict"></span></h3>
+      <div class="body"><div class="answer" id="answer">—</div></div>
+    </div>
+
+    <div class="card">
+      <h3>证据溯源</h3>
+      <div class="body" id="evidence"><div class="empty">—</div></div>
+    </div>
+  </section>
+
+  <!-- 右：审批台 + 指标 + 消融 -->
+  <section>
+    <div class="card" style="margin-bottom:14px;">
+      <h3>审批台 · HITL</h3>
+      <div class="body" id="pending"><div class="empty">没有待审批的调用。</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px;">
+      <h3>本次指标</h3>
+      <div class="body"><div class="metrics" id="metrics"></div></div>
+    </div>
+
+    <div class="card">
+      <h3>消融（ΔMRR，pp）</h3>
+      <div class="body"><table class="ablation" id="ablation" style="width:100%;border-collapse:collapse;"></table></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let mode = "pipeline";
+let currentRun = null;
+
+function setMode(m) {
+  mode = m;
+  $("mPipeline").classList.toggle("on", m === "pipeline");
+  $("mMulti").classList.toggle("on", m === "multiagent");
+}
+$("mPipeline").onclick = () => setMode("pipeline");
+$("mMulti").onclick = () => setMode("multiagent");
+
+document.querySelectorAll(".samples button").forEach((b) => {
+  b.onclick = () => { $("q").value = b.dataset.q; };
+});
+$("clr").onclick = () => {
+  $("q").value = ""; $("answer").textContent = "—";
+  $("steps").innerHTML = '<div class="empty">尚未提问。</div>';
+  $("stages").innerHTML = ""; $("evidence").innerHTML = '<div class="empty">—</div>';
+  $("metrics").innerHTML = ""; $("verdict").innerHTML = "";
+};
+
+async function api(path, body) {
+  const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {};
+  const r = await fetch(path, opt);
+  return await r.json();
+}
+
+$("ask").onclick = async () => {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("ask").disabled = true; $("ask").textContent = "运行中…";
+  try {
+    // 带副作用的请求走动作通道（会触发 HITL 审批）
+    if (/发邮件|建工单|删除|发送/.test(q)) {
+      const r = await api("/api/action", { question: q });
+      currentRun = r.run_id;
+      $("answer").textContent = r.status === "awaiting_approval"
+        ? "已挂起，等待人工审批（见右侧审批台）。"
+        : (r.answer || "—");
+      $("steps").innerHTML = '<div class="empty">动作运行：' + r.status + '</div>';
+      $("stages").innerHTML = "";
+      $("evidence").innerHTML = '<div class="empty">动作类请求不返回检索证据。</div>';
+      await refreshPending();
+    } else {
+      const r = await api("/api/ask", { question: q, mode });
+      render(r);
+    }
+  } catch (e) {
+    $("answer").textContent = "请求失败：" + e;
+  } finally {
+    $("ask").disabled = false; $("ask").textContent = "提问";
+  }
+};
+
+function render(r) {
+  // 答案（把 [n] 引用高亮）
+  $("answer").innerHTML = (r.answer || "—").replace(/\[(\d+)\]/g, '<span class="cite">[$1]</span>');
+  $("verdict").innerHTML = r.grounding
+    ? '<span class="verdict ' + r.grounding.verdict + '">' + r.grounding.verdict + '</span>' : "";
+
+  // 链路透视
+  const steps = (r.trace && r.trace.steps) || [];
+  if (steps.length) {
+    const kinds = {};
+    let total = 0;
+    steps.forEach((s) => { kinds[s.kind] = (kinds[s.kind] || 0) + s.duration_ms; total += s.duration_ms; });
+    const max = Math.max.apply(null, Object.values(kinds).concat([0.001]));
+    $("stages").innerHTML = Object.keys(kinds).map((k) => {
+      const ms = kinds[k];
+      return '<div class="stage"><div class="bar"><i style="width:' +
+        Math.max(4, (ms / max) * 100) + '%"></i></div><div class="nm">' + k +
+        '</div><div class="ms">' + ms.toFixed(1) + 'ms</div></div>';
+    }).join("");
+    $("steps").innerHTML = steps.map((s) => {
+      const o = JSON.stringify(s.outputs || {});
+      return '<div class="step"><div class="k">' + s.kind + '</div><div><div class="n">' +
+        (s.name || "") + '</div><div class="o">' + (o.length > 150 ? o.slice(0, 150) + "…" : o) +
+        '</div></div><div class="d">' + s.duration_ms.toFixed(1) + 'ms</div></div>';
+    }).join("");
+  } else {
+    $("steps").innerHTML = '<div class="empty">没有 trace。</div>';
+  }
+
+  // 证据
+  const ev = r.evidence || [];
+  $("evidence").innerHTML = ev.length ? ev.map((e, i) =>
+    '<div class="ev"><div class="hd"><span class="cite">[' + (i + 1) + ']</span>' +
+    '<span class="src">' + e.filename + '</span>' +
+    '<span class="sc">score ' + e.score + ' · L' + e.level + '</span></div>' +
+    '<div class="tx">' + e.text + '</div></div>').join("")
+    : '<div class="empty">没有检索到证据。</div>';
+
+  // 指标
+  const g = r.grounding || {};
+  const m = [
+    ["总耗时", ((r.trace && r.trace.total_duration_ms) || 0).toFixed(0) + "ms"],
+    ["证据数", (r.evidence || []).length],
+    ["归因支撑率", g.support_rate != null ? (g.support_rate * 100).toFixed(0) + "%" : "—"],
+    ["证据覆盖率", g.coverage != null ? (g.coverage * 100).toFixed(0) + "%" : "—"],
+    ["步数", ((r.trace && r.trace.steps) || []).length],
+    ["模式", r.mode],
+  ];
+  $("metrics").innerHTML = m.map(([k, v]) =>
+    '<div class="metric"><b>' + v + '</b><span>' + k + '</span></div>').join("");
+}
+
+async function refreshPending() {
+  const r = await api("/api/pending");
+  const items = r.pending || [];
+  const box = $("pending");
+  if (!items.length) { box.innerHTML = '<div class="empty">没有待审批的调用。</div>'; return; }
+  box.innerHTML = items.map((it) => {
+    const req = it.request || {};
+    const args = JSON.stringify(req.arguments || {});
+    return '<div class="req" data-run="' + it.run_id + '">' +
+      '<div class="top"><span class="risk ' + (req.risk_level || 'confirm') + '">' +
+      (req.risk_level || '?') + '</span><span class="tool">' + (req.tool_name || '') + '</span></div>' +
+      '<div class="why">' + (req.risk_reason || '') + '</div>' +
+      '<div class="args">参数：' + args + '</div>' +
+      '<textarea rows="3" class="editArgs" style="margin-top:6px;font-size:11px;">' + args + '</textarea>' +
+      '<div style="margin-top:8px;display:flex;gap:6px;">' +
+      '<button class="btn" data-act="approve">批准</button>' +
+      '<button class="btn ghost" data-act="reject">拒绝</button></div></div>';
+  }).join("");
+
+  box.querySelectorAll("button[data-act]").forEach((b) => {
+    b.onclick = async () => {
+      const card = b.closest(".req");
+      const runId = card.dataset.run;
+      const edited = card.querySelector(".editArgs").value.trim();
+      let parsed = null;
+      try { parsed = edited ? JSON.parse(edited) : null; } catch (e) { alert("参数不是合法 JSON"); return; }
+      const r = await api("/api/approve", {
+        run_id: runId, approved: b.dataset.act === "approve",
+        edited_arguments: parsed,
+      });
+      $("answer").textContent = r.status === "completed"
+        ? (r.answer || "动作已执行。") : ("状态：" + r.status);
+      await refreshPending();
+    };
+  });
+}
+
+async function boot() {
+  const h = await api("/api/health");
+  $("chipCorpus").textContent = "语料 " + h.documents + " 篇 / " + h.chunks + " 块";
+  $("chipModel").textContent = "model " + h.model;
+  const a = await api("/api/ablation");
+  const names = {
+    baseline_dense_only: "仅稠密（最大杠杆）", "-rerank": "关掉重排",
+    "-rewrite": "关掉改写", "-route": "关掉复杂度路由", "-merge": "关掉父块合并",
+    "-gate": "关掉充分性门控", "merge_replace": "父块合并改 REPLACE",
+  };
+  $("ablation").innerHTML = Object.keys(a.deltas_mrr).map((k) => {
+    const v = a.deltas_mrr[k];
+    const cls = v > 0 ? "pos" : (v < 0 ? "neg" : "zero");
+    return "<tr><td>" + (names[k] || k) + "</td><td class='" + cls + "'>" +
+      (v > 0 ? "+" : "") + v + "</td></tr>";
+  }).join("") + "<tr><td colspan='2' style='color:#8b949e;padding-top:6px;'>" + a.note + "</td></tr>";
+  await refreshPending();
+}
+boot();
+</script>
+</body>
+</html>

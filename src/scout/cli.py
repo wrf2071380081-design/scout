@@ -258,6 +258,19 @@ def cmd_hitl_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+# —— serve ——
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """启动 Web 控制台。"""
+
+    from .server import serve
+
+    corpus = args.corpus or str(Path(__file__).resolve().parents[2] / "datasets" / "longdoc-gold")
+    serve(corpus, host=args.host, port=args.port)
+    return 0
+
+
 # —— 参数解析 ——
 
 
@@ -275,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
     hitl = sub.add_parser("hitl", help="HITL 中断/审批/恢复/时间旅行演示")
     hitl.add_argument("--mode", choices=("demo",), default="demo", help="演示模式")
     hitl.set_defaults(func=cmd_hitl_demo)
+
+    serve = sub.add_parser("serve", help="启动本地 Web 控制台（离线，零新增依赖）")
+    serve.add_argument("--corpus", default="", help="语料目录，默认 datasets/longdoc-gold")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.set_defaults(func=cmd_serve)
 
     evaluation = sub.add_parser("eval", help="评测相关命令")
     eval_sub = evaluation.add_subparsers(dest="eval_command")
