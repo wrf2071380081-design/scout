@@ -286,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = eval_sub.add_parser("run", help="运行一次评测")
     run.add_argument("--dataset", default=DEFAULT_DATASET)
     run.add_argument("--corpus", default=DEFAULT_CORPUS)
-    run.add_argument("--mode", choices=("pipeline", "agent"), default="pipeline")
+    run.add_argument("--mode", choices=("pipeline", "agent", "multiagent"), default="pipeline")
     run.add_argument("--label", default="")
     run.add_argument("--limit", type=int, default=None)
     run.add_argument("--max-files", type=int, default=None)

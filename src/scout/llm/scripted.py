@@ -359,9 +359,40 @@ class HeuristicLLM:
     # —— 任务：子问题分解 ——
 
     def _task_subquestions(self, request: LLMRequest) -> str:
-        """按并列标记切分子问题，切不出多个就原样返回。"""
+        """把复杂问题拆成子问题。
 
-        question = self._user_question(request)
+        支持两种形态：
+
+        1. **对比类**（"A 和 B 分别……"）：给每个实体补全共享谓语。
+           早期版本按并列标记硬拆，会把短的实体侧（"Redis"）过滤掉，
+           只剩长的那一半——多智能体最需要拆的恰是这一类。
+        2. **并列类**（"……以及/同时/另外……"）：按并列标记切分。
+
+        切不出多个就原样返回，调用方回退单路。
+        """
+
+        question = self._user_question(request).strip("？?！! ")
+
+        # —— 形态 1：对比类 "A 和/与/或/对比 B + 共享谓语" ——
+        comparison = re.split(r"\s*(?:和|与|跟|或|对比|相比|，|,\s*)\s*", question, maxsplit=1)
+        if len(comparison) == 2:
+            left, right = comparison[0].strip(), comparison[1].strip()
+            pred_match = re.search(r"(分别|各自|是|怎么|如何|有|的)", right)
+            if left and pred_match and len(left) >= 2 and pred_match.start() >= 1:
+                entity_right = right[: pred_match.start()].strip(" ，,、")
+                predicate = re.sub(r"^(分别|各自|哪个更|相比下|两者)", "", right[pred_match.start():]).strip()
+                if len(entity_right) >= 1 and predicate:
+                    parts = [
+                        f"{left}{predicate}",
+                        f"{entity_right}{predicate}",
+                    ]
+                    parts = [part for part in parts if len(part) >= 6]
+                    if len(parts) >= 2:
+                        import json
+
+                        return json.dumps({"questions": parts[:4]}, ensure_ascii=False)
+
+        # —— 形态 2：并列拆分 ——
         parts = re.split(r"(?:以及|并且|同时|，另外|；|;|和(?=[^，。]{6,}))", question)
         candidates = [part.strip(" ，。？?") for part in parts if len(part.strip()) >= 8]
         if len(candidates) < 2:

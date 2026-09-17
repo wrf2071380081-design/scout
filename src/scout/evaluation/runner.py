@@ -25,6 +25,7 @@ from ..agent.loop import ToolAgent
 from ..config import Settings, get_settings
 from ..llm.base import LLMClient
 from ..llm.scripted import default_client
+from ..multiagent import MultiAgentOrchestrator
 from ..orchestrator.healing import SelfHealingOrchestrator
 from ..rag.index import HybridIndex, RetrievalMode
 from ..rag.merge import MergeMode
@@ -220,6 +221,51 @@ def _observe_agent(
     return observation, latency_ms
 
 
+def _observe_multiagent(
+    orchestrator: MultiAgentOrchestrator,
+    case: EvalCase,
+) -> tuple[CaseObservation, float]:
+    """以多智能体模式跑一条样本。
+
+    检索证据取**所有成功子 Agent 的压缩证据并集**——这是"上下文隔离"的价值所在：
+    每个子 Agent 独立检索自己的那片，合并后覆盖单个 Top-K 覆盖不到的多文档场景。
+    """
+
+    started = time.perf_counter()
+    result = orchestrator.answer(case.question)
+    latency_ms = (time.perf_counter() - started) * 1000.0
+
+    # 证据统一从 result.units 取：多智能体路径是各子 Agent 压缩证据的并集，
+    # 单路回退路径是回退到的那次检索的证据。两条路径都不能漏记。
+    merged_units = list(result.units)
+    # 用原始叶子块文本做 gold 匹配（见 _observe_pipeline 的说明）。
+    observation = CaseObservation(
+        case_id=case.case_id,
+        question=case.question,
+        outcome=result.outcome,
+        answer=result.answer,
+        retrieved_chunk_ids=[unit.chunk.chunk_id for unit in merged_units],
+        retrieved_sources=[unit.chunk.filename for unit in merged_units],
+        retrieved_texts=[unit.chunk.text for unit in merged_units],
+        latency_ms=latency_ms,
+        step_count=len(result.trace.steps) if result.trace else 0,
+        tool_call_count=0,
+        answer_support_rate=(result.grounding.support_rate if result.grounding else 0.0),
+        answer_coverage=(result.grounding.coverage if result.grounding else 0.0),
+        abstained=abstained_from(result.answer, result.outcome),
+        error_code="",
+        meta={
+            "mode": result.meta.get("mode"),
+            "subagents_total": result.meta.get("subagents_total", 0),
+            "subagents_completed": result.meta.get("subagents_completed", 0),
+            "coverage_gaps": len(result.coverage_gaps),
+            "plan": result.plan,
+            "grounding_verdict": (result.grounding.verdict.value if result.grounding else None),
+        },
+    )
+    return observation, latency_ms
+
+
 def run_evaluation(
     dataset: EvalDataset,
     documents: Sequence[tuple[str, str]],
@@ -251,6 +297,10 @@ def run_evaluation(
             registry.register(spec)
         agent = ToolAgent(client, registry, settings=effective, orchestrator=SelfHealingOrchestrator())
 
+    orchestrator: MultiAgentOrchestrator | None = None
+    if config.mode == "multiagent":
+        orchestrator = MultiAgentOrchestrator(pipeline, client, settings=effective, config=config.pipeline_config)
+
     observations: list[CaseObservation] = []
     case_metrics: list[CaseMetrics] = []
     started_at = time.time()
@@ -258,6 +308,8 @@ def run_evaluation(
     for case in cases:
         if config.mode == "agent" and agent is not None:
             observation, _latency = _observe_agent(agent, pipeline, case)
+        elif config.mode == "multiagent" and orchestrator is not None:
+            observation, _latency = _observe_multiagent(orchestrator, case)
         else:
             observation, _latency = _observe_pipeline(pipeline, case)
         observations.append(observation)
