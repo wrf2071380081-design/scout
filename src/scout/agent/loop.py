@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import AgentSettings, Settings, get_settings
-from ..errors import BudgetExceededError, ErrorCode, ScoutError
+from ..errors import BudgetExceededError, ErrorCode, ProviderError, ScoutError
 from ..llm.base import ChatMessage, LLMClient, LLMRequest, TokenUsage, ToolCall
 from ..prompts import AGENT_SYSTEM_PROMPT, format_evidence, pack_evidence
 from ..trace import StepKind, Trace
@@ -39,6 +39,9 @@ from ..tools.registry import ToolRegistry, ToolResult
 ANSWERED = "answered"
 BUDGET_STOPPED = "budget_exceeded"
 NO_ANSWER = "no_answer"
+PROVIDER_TIMEOUT = "provider_timeout"
+"""模型服务不可用时的语义化结果。必须和"不知道"区分，
+否则系统会把"服务挂了"误导成"知识库没有"——完全不同的两个问题。"""
 
 
 @dataclass(slots=True)
@@ -190,50 +193,68 @@ class ToolAgent:
                 result.meta["stop_reason"] = "deadline_exceeded"
                 break
 
-            with trace.step("agent_step", StepKind.PLAN, index=step_index) as step:
-                response = self.llm.complete(
-                    LLMRequest(
-                        messages=messages,
-                        tools=self.registry.schemas(),
-                        task="decide",
-                        context={"question": question, "step": step_index},
-                        deadline=deadline,
+            try:
+                with trace.step("agent_step", StepKind.PLAN, index=step_index) as step:
+                    response = self.llm.complete(
+                        LLMRequest(
+                            messages=messages,
+                            tools=self.registry.schemas(),
+                            task="decide",
+                            context={"question": question, "step": step_index},
+                            deadline=deadline,
+                        )
                     )
-                )
-                result.usage.input_tokens += response.usage.input_tokens
-                result.usage.output_tokens += response.usage.output_tokens
+                    result.usage.input_tokens += response.usage.input_tokens
+                    result.usage.output_tokens += response.usage.output_tokens
 
-                record = AgentStep(index=step_index, thought=response.content.strip()[:200])
+                    record = AgentStep(index=step_index, thought=response.content.strip()[:200])
 
-                if not response.has_tool_calls:
-                    if response.content.strip():
-                        result.answer = response.content.strip()
-                        result.outcome = ANSWERED
-                        result.meta["stop_reason"] = "model_final_answer"
-                    else:
-                        result.meta["stop_reason"] = "empty_final_answer"
-                    step.outputs = {"final": True, "chars": len(response.content)}
-                    result.steps.append(record)
-                    break
+                    if not response.has_tool_calls:
+                        if response.content.strip():
+                            result.answer = response.content.strip()
+                            result.outcome = ANSWERED
+                            result.meta["stop_reason"] = "model_final_answer"
+                        else:
+                            result.meta["stop_reason"] = "empty_final_answer"
+                        step.outputs = {"final": True, "chars": len(response.content)}
+                        result.steps.append(record)
+                        break
 
-                messages.append(
-                    ChatMessage(role="assistant", content=response.content, tool_calls=list(response.tool_calls))
-                )
-
-                for call in response.tool_calls:
-                    observation, observed = self._execute(
-                        call,
-                        call_signatures=call_signatures,
-                        messages=messages,
-                        deadline=deadline,
-                    )
-                    record.calls.append(observed)
                     messages.append(
-                        ChatMessage(role="tool", content=observation, name=call.name, tool_call_id=call.id)
+                        ChatMessage(role="assistant", content=response.content, tool_calls=list(response.tool_calls))
                     )
 
-                step.outputs = {"calls": [item.to_dict() for item in record.calls]}
-                result.steps.append(record)
+                    for call in response.tool_calls:
+                        observation, observed = self._execute(
+                            call,
+                            call_signatures=call_signatures,
+                            messages=messages,
+                            deadline=deadline,
+                        )
+                        record.calls.append(observed)
+                        messages.append(
+                            ChatMessage(role="tool", content=observation, name=call.name, tool_call_id=call.id)
+                        )
+
+                    step.outputs = {"calls": [item.to_dict() for item in record.calls]}
+                    result.steps.append(record)
+            except ScoutError as exc:
+                # Provider 或任何 typed 错误穿透到这里时，必须先归类：
+                # 它可以是一次可恢复的临时故障，也可以是必须终止的硬错误。
+                # 静默上升等于让主调用栈去猜这是什么——这是不能接受的。
+                signal = self.orchestrator.classify(exc, stage="decide")
+                decision = self.orchestrator.decide(signal)
+                if decision.action is RecoveryAction.RETRY and exc.retryable:
+                    self.orchestrator.consume(signal, decision)
+                    self.orchestrator.mark_recovered(signal, decision)
+                    result.meta.setdefault("recoveries", []).append(decision.to_dict())
+                    continue
+                self.orchestrator.mark_failed(signal, decision)
+                result.outcome = PROVIDER_TIMEOUT if isinstance(exc, ProviderError) else NO_ANSWER
+                result.error_code = exc.code.value
+                result.answer = "抱歉，模型服务当前不可用，请稍后重试。" if isinstance(exc, ProviderError) else "抱歉，处理过程中发生错误，未能完成任务。"
+                result.meta["stop_reason"] = "typed_failure"
+                break
         else:
             # for-else：步数用尽仍未产出最终答案。
             result.outcome = BUDGET_STOPPED
@@ -414,6 +435,7 @@ __all__ = [
     "ANSWERED",
     "BUDGET_STOPPED",
     "NO_ANSWER",
+    "PROVIDER_TIMEOUT",
     "AgentRunResult",
     "AgentStep",
     "ObservedCall",

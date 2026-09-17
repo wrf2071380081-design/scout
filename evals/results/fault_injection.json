@@ -1,0 +1,116 @@
+{
+  "generated_at": "2026-09-17 20:49:38",
+  "total_scenarios": 8,
+  "typed_failure_rate": 1.0,
+  "recovery_rate_within_budget": 1.0,
+  "uncaught_crash_count": 0,
+  "scenarios": [
+    {
+      "name": "provider_timeout_once",
+      "description": "decide 阶段 provider 超时一次，第二次恢复",
+      "injected_fault": "ProviderError(retryable=True) at task=decide ×1",
+      "expected_behavior": "重试一次后正常完成，恢复统计里可见这次重试",
+      "outcome": "answered",
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "recovery_stats": null,
+        "recovery_attempts": null
+      }
+    },
+    {
+      "name": "provider_persistent_failure",
+      "description": "provider 持续超时直到预算耗尽",
+      "injected_fault": "ProviderError(retryable=True) 永久",
+      "expected_behavior": "预算耗尽后类型化失败（provider_timeout），不崩溃不静默",
+      "outcome": "provider_timeout",
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "recovery_stats": null,
+        "recovery_attempts": null
+      }
+    },
+    {
+      "name": "malformed_tool_args",
+      "description": "模型发出非法参数的工具调用",
+      "injected_fault": "calculator(expression='1+(')",
+      "expected_behavior": "Schema 校验失败 → 错误回灌 → 模型修正或诚实停止",
+      "outcome": "answered",
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "recovery_stats": null
+      }
+    },
+    {
+      "name": "repeat_call_loop",
+      "description": "模型反复用同一参数调用同一工具",
+      "injected_fault": "同一 calculator 调用 ×6",
+      "expected_behavior": "重复调用被抑制，预算终止或最终作答，不崩溃不烧穿预算",
+      "outcome": "answered",
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "repeated_call_count": 4,
+        "stop_reason": "model_final_answer"
+      }
+    },
+    {
+      "name": "unknown_tool",
+      "description": "模型调用了注册表里不存在的工具",
+      "injected_fault": "ToolCall(name='nonexistent_tool')",
+      "expected_behavior": "类型化错误（tool_not_found），Agent 继续或诚实停止",
+      "outcome": "answered",
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "recovery_stats": null
+      }
+    },
+    {
+      "name": "corrupted_checkpoint",
+      "description": "HITL 断点状态被篡改/损坏",
+      "injected_fault": "从外部写入与 schema 不符的检查点",
+      "expected_behavior": "ValidationError 显式失败，不渲染半对状态",
+      "outcome": null,
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "error_code": "VALIDATION_FAILED"
+      }
+    },
+    {
+      "name": "crash_mid_jsonl",
+      "description": "JSONL 检查点最后一行写坏",
+      "injected_fault": "最后一个 JSONL 行截断",
+      "expected_behavior": "跳过损坏行、从上一份完好的检查点恢复，不丢全部状态",
+      "outcome": null,
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "recovered_step": 0
+      }
+    },
+    {
+      "name": "hitl_timeout_reject",
+      "description": "HITL 审批超时",
+      "injected_fault": "timeout_policy=REJECT + approval_deadline=0",
+      "expected_behavior": "自动拒绝该调用并继续，副作用不发生",
+      "outcome": "completed",
+      "recovered": true,
+      "crashed": false,
+      "exception": null,
+      "details": {
+        "reject_source": "timeout_policy"
+      }
+    }
+  ]
+}
