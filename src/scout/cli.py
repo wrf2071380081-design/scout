@@ -258,6 +258,19 @@ def cmd_hitl_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+# —— mcp ——
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """以 MCP Server 运行。"""
+
+    from .mcp import run_mcp
+
+    corpus = args.corpus or str(Path(__file__).resolve().parents[2] / "datasets" / "longdoc-gold")
+    run_mcp(corpus)
+    return 0
+
+
 # —— serve ——
 
 
@@ -288,6 +301,10 @@ def build_parser() -> argparse.ArgumentParser:
     hitl = sub.add_parser("hitl", help="HITL 中断/审批/恢复/时间旅行演示")
     hitl.add_argument("--mode", choices=("demo",), default="demo", help="演示模式")
     hitl.set_defaults(func=cmd_hitl_demo)
+
+    mcp = sub.add_parser("mcp", help="以 MCP Server 运行（stdio，供 Agent 客户端接入）")
+    mcp.add_argument("--corpus", default="", help="语料目录，默认 datasets/longdoc-gold")
+    mcp.set_defaults(func=cmd_mcp)
 
     serve = sub.add_parser("serve", help="启动本地 Web 控制台（离线，零新增依赖）")
     serve.add_argument("--corpus", default="", help="语料目录，默认 datasets/longdoc-gold")

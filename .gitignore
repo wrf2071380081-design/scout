@@ -37,3 +37,6 @@ datasets/**/*.pdf
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 公开数据集（体积大，按需下载，见 scripts/bench_musique.py 顶部说明）
+datasets/musique_ans_dev.jsonl
