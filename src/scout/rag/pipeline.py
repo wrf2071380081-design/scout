@@ -1,0 +1,559 @@
+"""RAG 流水线与消融开关。
+
+这个模块的设计目标只有一个：**让每一个模块都能被单独打开和关闭**。
+
+原因很直接——如果代码里不存在"关掉 Auto-merge"的开关，那么
+"Auto-merge 到底有没有用"这个问题就永远只能靠直觉回答。
+本项目的差异化恰恰建立在这类问题的**可测量**上，所以开关是一等公民：
+
+===================  ==================================================
+``complexity_routing``  复杂度判定 → 简单问题单路检索 / 复杂问题子问题分解并行检索
+``retrieval_mode``      混合 / 仅稠密 / 仅稀疏
+``merge_mode``          Auto-merge 的 replace / expand / off
+``rerank_enabled``      是否重排
+``rewrite_enabled``     是否允许缺陷触发的查询改写
+``sufficiency_gate``    是否启用证据充分性门控（关掉后拒答率必然归零）
+``injection_defense``   是否启用检索侧消毒与归因门控
+===================  ==================================================
+
+时序上有一个刻意的约束：**改写最多一次，重生成最多一次**。
+无界循环是 Agent 系统最常见的失控方式，而"再多试一次"的边际收益
+远低于它的成本与延迟代价。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from ..config import Settings, get_settings
+from ..errors import InsufficientEvidenceError, NoKnowledgeError
+from ..llm.base import ChatMessage, LLMClient, LLMRequest
+from ..llm.scripted import default_client
+from ..prompts import (
+    ANSWER_PROMPT,
+    COMPLEXITY_PROMPT,
+    GRADE_PROMPT,
+    SUBQUESTION_PROMPT,
+    ComplexityPlan,
+    GradePlan,
+    SubQuestions,
+    format_evidence,
+    pack_evidence,
+)
+from ..trace import StepKind, Trace
+from ..verify.grounding import GroundingReport, Verdict, verify_answer
+from ..verify.sanitize import neutralize, sanitize_text
+from .index import HybridIndex, RetrievalMode, ScoredChunk
+from .merge import EvidenceUnit, MergeMode, MergeOutcome, auto_merge
+from .ranking import LexicalReranker, RerankOutcome
+from .rewrite import RewriteAdvisor, RewritePlan, apply_plan
+
+ANSWERED = "answered"
+NO_KNOWLEDGE = "no_knowledge"
+INSUFFICIENT = "insufficient_evidence"
+CLARIFY = "clarify"
+
+ABSTENTION_ANSWER = "根据现有资料无法回答该问题。"
+CLARIFY_ANSWER = "当前问题缺少必要的限定条件，请补充具体对象、时间范围或场景后我再尝试回答。"
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineConfig:
+    """流水线的消融开关组合。
+
+    ``label()`` 用于在评测报告里给每种组合起一个稳定短名，
+    这样消融表可以直接用配置名做行标题。
+    """
+
+    complexity_routing: bool = True
+    retrieval_mode: RetrievalMode = RetrievalMode.HYBRID
+    merge_mode: MergeMode = MergeMode.EXPAND
+    merge_threshold: int = 2
+    rerank_enabled: bool = True
+    rewrite_enabled: bool = True
+    sufficiency_gate: bool = True
+    injection_defense: bool = True
+    max_rewrites: int = 1
+    max_regenerations: int = 1
+
+    def label(self) -> str:
+        parts: list[str] = []
+        parts.append("route" if self.complexity_routing else "noroute")
+        parts.append(self.retrieval_mode.value)
+        parts.append(f"merge-{self.merge_mode.value}")
+        parts.append("rerank" if self.rerank_enabled else "norerank")
+        parts.append("rewrite" if self.rewrite_enabled else "norewrite")
+        parts.append("gate" if self.sufficiency_gate else "nogate")
+        return "+".join(parts)
+
+    def with_overrides(self, **kwargs: Any) -> PipelineConfig:
+        return replace(self, **kwargs)
+
+
+@dataclass(slots=True)
+class PipelineResult:
+    """一次问答的完整产出。"""
+
+    question: str
+    answer: str
+    outcome: str
+    units: list[EvidenceUnit] = field(default_factory=list)
+    grounding: GroundingReport = field(default_factory=GroundingReport)
+    trace: Trace | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+    error_code: str = ""
+
+    @property
+    def evidence_ids(self) -> list[str]:
+        return [unit.chunk.chunk_id for unit in self.units]
+
+    @property
+    def source_filenames(self) -> list[str]:
+        seen: list[str] = []
+        for unit in self.units:
+            if unit.chunk.filename not in seen:
+                seen.append(unit.chunk.filename)
+        return seen
+
+    def to_dict(self, *, include_evidence_text: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "question": self.question,
+            "answer": self.answer,
+            "outcome": self.outcome,
+            "error_code": self.error_code or None,
+            "evidence_ids": self.evidence_ids,
+            "source_filenames": self.source_filenames,
+            "evidence_count": len(self.units),
+            **self.grounding.to_meta(),
+            **self.meta,
+        }
+        if include_evidence_text:
+            payload["evidence"] = [unit.to_dict() for unit in self.units]
+        return payload
+
+
+class RAGPipeline:
+    """可配置、可观测、可消融的 RAG 流水线。"""
+
+    def __init__(
+        self,
+        index: HybridIndex,
+        llm: LLMClient | None = None,
+        *,
+        settings: Settings | None = None,
+        config: PipelineConfig | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.config = config or PipelineConfig(
+            merge_mode=MergeMode.EXPAND if self.settings.retrieval.auto_merge_enabled else MergeMode.OFF,
+            merge_threshold=self.settings.retrieval.auto_merge_threshold,
+            rerank_enabled=self.settings.retrieval.rerank_enabled,
+        )
+        self.index = index
+        self.llm: LLMClient = llm or default_client()
+        self.reranker = LexicalReranker(
+            candidate_limit=max(self.settings.retrieval.top_k * 4, 20),
+            min_score=self.settings.retrieval.rerank_min_score,
+        )
+        stats = index.corpus_stats()
+        self.advisor = RewriteAdvisor(
+            vocabulary=index.vocabulary,
+            document_frequency=index.document_frequency,
+        )
+        # 语料级统计缓存：充分性判定与评分都要用到稀有度加权，
+        # 每次调用现算会重复遍历全部文档，这里在构造期取一次。
+        #
+        # 注意 corpus_size 的口径必须与 document_frequency 一致：
+        # BM25 是在**叶子块**上拟合的，所以 df 的统计基数是 chunk 数而不是文档数。
+        # 早期版本这里传了文档数（40 而 df 可达 988），
+        # 导致 df > N、IDF 变负、覆盖率算出 -83 这种荒谬值。
+        self._document_frequency = index.document_frequency
+        self._corpus_size = len(index.chunks) or 1
+        self._corpus_stats = stats
+
+    def idf_context(self) -> dict[str, Any]:
+        """语料级稀有度统计，供充分性判定与评分器使用。
+
+        公开这个方法而不是让调用方去翻 ``_document_frequency``，
+        是因为 Agent 侧（``scout.agent.loop``）也需要在收尾校验时用到它。
+        """
+
+        return {
+            "document_frequency": self._document_frequency,
+            "corpus_size": self._corpus_size,
+        }
+
+    # —— 检索阶段 ——
+
+    def _plan_queries(self, question: str, trace: Trace) -> list[str]:
+        if not self.config.complexity_routing:
+            return [question]
+        with trace.step("complexity", StepKind.PLAN, question=question) as step:
+            response = self.llm.complete(
+                LLMRequest(
+                    messages=[ChatMessage(role="user", content=COMPLEXITY_PROMPT.format(question=question))],
+                    schema=ComplexityPlan,
+                    task="complexity",
+                    context={"question": question},
+                )
+            )
+            plan = response.parse(ComplexityPlan)
+            step.outputs = {"complexity": plan.complexity, "reason": plan.reason}
+        if plan.complexity == "simple":
+            return [question]
+
+        with trace.step("subquestions", StepKind.PLAN, question=question) as step:
+            response = self.llm.complete(
+                LLMRequest(
+                    messages=[ChatMessage(role="user", content=SUBQUESTION_PROMPT.format(question=question))],
+                    schema=SubQuestions,
+                    task="subquestions",
+                    context={"question": question},
+                )
+            )
+            try:
+                parsed = response.parse(SubQuestions)
+            except Exception:  # noqa: BLE001 - 分解失败时退化为单路检索，属于允许的降级
+                parsed = SubQuestions(questions=[])
+            questions = [item for item in parsed.questions if item.strip()][:4]
+            step.outputs = {"count": len(questions)}
+        return questions or [question]
+
+    def _search(self, query: str, trace: Trace) -> list[ScoredChunk]:
+        with trace.step("retrieve", StepKind.RETRIEVE, query=query) as step:
+            result = self.index.search(
+                query,
+                top_k=self.settings.retrieval.top_k * 2,
+                mode=self.config.retrieval_mode,
+            )
+            step.outputs = result.to_meta()
+        return result.hits
+
+    @staticmethod
+    def _dedupe(hits: list[ScoredChunk]) -> list[ScoredChunk]:
+        """按 chunk_id 去重，保留更高分，且保持首次出现的顺序。"""
+
+        best: dict[str, ScoredChunk] = {}
+        order: list[str] = []
+        for hit in hits:
+            key = hit.chunk.chunk_id
+            if key not in best:
+                best[key] = hit
+                order.append(key)
+            elif hit.score > best[key].score:
+                best[key] = hit
+        return [best[key] for key in order]
+
+    def _postprocess(
+        self,
+        query: str,
+        hits: list[ScoredChunk],
+        trace: Trace,
+    ) -> tuple[list[EvidenceUnit], MergeOutcome, RerankOutcome | None]:
+        """Auto-merge → 重排。两者的顺序固定：先合并再重排。"""
+
+        units = [EvidenceUnit(chunk=hit.chunk, score=hit.score) for hit in hits]
+        with trace.step("auto_merge", StepKind.MERGE, units=len(units)) as step:
+            units, merge_outcome = auto_merge(
+                units,
+                self.index.catalog,
+                mode=self.config.merge_mode,
+                threshold=self.config.merge_threshold,
+            )
+            step.outputs = merge_outcome.to_meta()
+
+        rerank_outcome: RerankOutcome | None = None
+        if self.config.rerank_enabled:
+            with trace.step("rerank", StepKind.RERANK, candidates=len(units)) as step:
+                rerank_outcome = self.reranker.rerank(
+                    query,
+                    [(unit.chunk.chunk_id, unit.context_text) for unit in units],
+                    enabled=True,
+                )
+                score_map = dict(rerank_outcome.ordered)
+                order = [identifier for identifier, _ in rerank_outcome.ordered]
+                by_id = {unit.chunk.chunk_id: unit for unit in units}
+                for identifier in order:
+                    unit = by_id.get(identifier)
+                    if unit is not None:
+                        unit.score = score_map.get(identifier, unit.score)
+                units = [by_id[identifier] for identifier in order if identifier in by_id]
+                step.outputs = rerank_outcome.to_meta()
+        return units, merge_outcome, rerank_outcome
+
+    def _grade(self, question: str, units: list[EvidenceUnit], trace: Trace) -> GradePlan:
+        packed, _dropped = pack_evidence(units, budget_chars=self.settings.retrieval.grader_evidence_chars)
+        with trace.step("grade", StepKind.GRADE, candidates=len(units), packed=len(packed)) as step:
+            response = self.llm.complete(
+                LLMRequest(
+                    messages=[
+                        ChatMessage(
+                            role="user",
+                            content=GRADE_PROMPT.format(
+                                question=question,
+                                evidence=format_evidence(packed) or "（无证据）",
+                            ),
+                        )
+                    ],
+                    schema=GradePlan,
+                    task="grade",
+                    context={"question": question, "evidence_count": len(packed), **self.idf_context()},
+                )
+            )
+            try:
+                plan = response.parse(GradePlan)
+            except Exception:  # noqa: BLE001 - 评分失败按"可作答"处理，交由充分性门控兜底
+                plan = GradePlan(relevance=0.0, coverage=0.0, answerable=bool(units), route="answer")
+            step.outputs = plan.model_dump()
+        return plan
+
+    # —— 消毒 ——
+
+    def _sanitize_units(self, units: list[EvidenceUnit], trace: Trace) -> list[EvidenceUnit]:
+        if not self.config.injection_defense or not self.settings.verify.sanitize_enabled:
+            return units
+        with trace.step("sanitize", StepKind.VERIFY, units=len(units)) as step:
+            suspicious = 0
+            removed = 0
+            for unit in units:
+                report = sanitize_text(unit.context_text)
+                if report.removed_html_blocks or report.removed_invisible or report.stripped_tags:
+                    removed += report.removed_html_blocks + report.stripped_tags
+                if report.suspicious:
+                    suspicious += 1
+                    unit.context_text = neutralize(report.text)
+                elif report.text:
+                    unit.context_text = report.text
+            step.outputs = {
+                "sanitize_suspicious_units": suspicious,
+                "sanitize_stripped_blocks": removed,
+            }
+            step.metrics = {"injection_signals": suspicious}
+        return units
+
+    # —— 生成 ——
+
+    def _generate(self, question: str, units: list[EvidenceUnit], trace: Trace, *, strict: bool = False) -> str:
+        packed, _dropped = pack_evidence(units, budget_chars=self.settings.retrieval.evidence_budget_chars)
+        prompt = ANSWER_PROMPT.format(question=question, evidence=format_evidence(packed) or "（无证据）")
+        if strict:
+            prompt = (
+                "注意：上一版回答中存在无法被证据支撑的结论。"
+                "这一版必须做到每一句话都能在证据里找到出处，无法支撑的内容直接省略。\n\n" + prompt
+            )
+        with trace.step("generate", StepKind.GENERATE, evidence=len(packed), strict=strict) as step:
+            response = self.llm.complete(
+                LLMRequest(
+                    messages=[ChatMessage(role="user", content=prompt)],
+                    task="answer",
+                    context={"question": question, "evidence_count": len(packed)},
+                )
+            )
+            step.outputs = {"answer_chars": len(response.content)}
+            step.metrics = response.usage.to_dict()
+        return response.content.strip()
+
+    # —— 检索编排（流水线与 Agent 工具共用同一段实现） ——
+
+    def collect(
+        self,
+        question: str,
+        trace: Trace,
+        *,
+        original_question: str | None = None,
+    ) -> tuple[list[EvidenceUnit], dict[str, Any], GradePlan]:
+        """检索 → 合并 → 重排 → 评分（**不含生成**）。
+
+        Agent 的 ``knowledge_search`` 工具与流水线的单次问答都走这里。
+        共用一段编排是刻意的：如果工具侧另写一套检索，两边就会随时间漂移，
+        评测拿到的好成绩也不再代表 Agent 的真实表现。
+        """
+
+        queries = self._plan_queries(question, trace)
+        all_hits: list[ScoredChunk] = []
+        for query in queries:
+            all_hits.extend(self._search(query, trace))
+        hits = self._dedupe(all_hits)
+
+        meta: dict[str, Any] = {
+            "retrieval_subquery_count": len(queries),
+            "retrieval_unique_candidates": len(hits),
+            "auto_merge_mode": self.config.merge_mode.value,
+        }
+        if not hits:
+            return [], meta, GradePlan(relevance=0.0, coverage=0.0, answerable=False, route="no_knowledge")
+
+        units, merge_outcome, rerank_outcome = self._postprocess(queries[0], hits, trace)
+        meta.update(merge_outcome.to_meta())
+        if rerank_outcome is not None:
+            meta.update(rerank_outcome.to_meta())
+
+        grade = self._grade(original_question or question, units, trace)
+        meta.update(
+            {
+                "grade_relevance": grade.relevance,
+                "grade_coverage": grade.coverage,
+                "grade_answerable": grade.answerable,
+                "grade_route": grade.route,
+            }
+        )
+        return units, meta, grade
+
+    # —— 主入口 ——
+
+    def answer(self, question: str) -> PipelineResult:
+        """执行一次完整问答。"""
+
+        trace = Trace(question=question)
+        result = PipelineResult(question=question, answer="", outcome=NO_KNOWLEDGE, trace=trace)
+        result.meta["config_label"] = self.config.label()
+
+        units, meta, grade = self.collect(question, trace)
+        result.meta.update(meta)
+
+        if not units:
+            result.outcome = NO_KNOWLEDGE
+            result.answer = ABSTENTION_ANSWER
+            result.error_code = NoKnowledgeError.default_code.value
+            return result
+
+        if self.config.rewrite_enabled and grade.route == "rewrite":
+            with trace.step("rewrite_diagnose", StepKind.REWRITE, question=question) as step:
+                report = self.advisor.diagnose(question)
+                plan: RewritePlan = self.advisor.plan(question, report, llm=self.llm)
+                step.outputs = {"method": plan.method.value, "reason": plan.reason, **report.to_meta()}
+            result.meta["rewrite_triggered"] = plan.triggers
+            result.meta["rewrite_method"] = plan.method.value
+            result.meta["rewrite_reason"] = plan.reason
+            if plan.triggers:
+                rewritten = apply_plan(question, plan)
+                second_units, second_meta, second_grade = self.collect(
+                    rewritten, trace, original_question=question
+                )
+                if second_units:
+                    units, grade = second_units, second_grade
+                    result.meta.update(second_meta)
+                    result.meta["rewrite_improved"] = bool(second_grade.answerable)
+
+        units = self._sanitize_units(units, trace)
+        result.units = units
+
+        if grade.route == "clarify" or grade.ambiguous:
+            result.outcome = CLARIFY
+            result.answer = CLARIFY_ANSWER
+            result.error_code = InsufficientEvidenceError.default_code.value
+            return result
+
+        if not grade.answerable:
+            result.outcome = INSUFFICIENT
+            result.answer = ABSTENTION_ANSWER
+            result.error_code = InsufficientEvidenceError.default_code.value
+            return result
+
+        answer = self._generate(question, units, trace)
+        grounding: GroundingReport = verify_answer(
+            question,
+            answer,
+            units,
+            settings=self.settings.verify if self.config.sufficiency_gate else None,
+            document_frequency=self._document_frequency,
+            corpus_size=self._corpus_size,
+        )
+        if not self.config.sufficiency_gate:
+            grounding.verdict = Verdict.PASS
+            grounding.reason = "gate_disabled"
+
+        regenerations = 0
+        while (
+            grounding.verdict is Verdict.REGENERATE
+            and regenerations < self.config.max_regenerations
+        ):
+            regenerations += 1
+            with trace.step("regenerate", StepKind.GENERATE, attempt=regenerations) as step:
+                answer = self._generate(question, units, trace, strict=True)
+                step.outputs = {"answer_chars": len(answer)}
+            grounding = verify_answer(
+                question,
+                answer,
+                units,
+                settings=self.settings.verify,
+                document_frequency=self._document_frequency,
+                corpus_size=self._corpus_size,
+            )
+
+        result.grounding = grounding
+        result.meta["regenerations"] = regenerations
+
+        if self.config.sufficiency_gate and grounding.verdict is Verdict.ABSTAIN:
+            result.outcome = INSUFFICIENT
+            result.answer = ABSTENTION_ANSWER
+            result.error_code = InsufficientEvidenceError.default_code.value
+            return result
+
+        result.answer = answer
+        result.outcome = ANSWERED
+        result.meta["trace_durations_ms"] = trace.kind_durations()
+        result.meta["total_duration_ms"] = trace.total_duration_ms()
+        return result
+
+    def answer_or_raise(self, question: str) -> PipelineResult:
+        """与 :meth:`answer` 相同，但把「无知识 / 证据不足」抛成 typed 异常。
+
+        供需要区分"语义结果"与"故障"的调用方使用（例如评测运行器要统计
+        各类结果的分布，而 Agent 循环要把无知识渲染成对用户友好的措辞）。
+        """
+
+        result = self.answer(question)
+        if result.outcome == NO_KNOWLEDGE:
+            raise NoKnowledgeError("retrieval returned no candidates for the question")
+        if result.outcome == INSUFFICIENT:
+            raise InsufficientEvidenceError(
+                "retrieved evidence does not sufficiently cover the question",
+                missing=[str(item) for item in result.meta.get("missing", [])] if result.meta else [],
+            )
+        return result
+
+
+def build_index(
+    documents: list[tuple[str, str]],
+    *,
+    settings: Settings | None = None,
+    embedder: Any = None,
+) -> HybridIndex:
+    """便捷构造：``documents`` 为 ``[(filename, text), ...]``。
+
+    评测脚本与测试都走这个入口，保证"索引构建方式"只有一处定义——
+    否则不同脚本各建一次索引，报告之间就不可比。
+    """
+
+    from .embed import HashingEmbedder
+
+    effective = settings or get_settings()
+    index = HybridIndex(
+        embedder=embedder or HashingEmbedder(),
+        settings=effective.retrieval,
+    )
+    for position, (filename, text) in enumerate(documents):
+        index.add_document(
+            text,
+            document_id=f"doc-{position:03d}",
+            document_version="v1",
+            filename=filename,
+        )
+    index.build()
+    return index
+
+
+__all__ = [
+    "ABSTENTION_ANSWER",
+    "ANSWERED",
+    "CLARIFY",
+    "CLARIFY_ANSWER",
+    "INSUFFICIENT",
+    "NO_KNOWLEDGE",
+    "PipelineConfig",
+    "PipelineResult",
+    "RAGPipeline",
+    "build_index",
+]

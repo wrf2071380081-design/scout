@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtualenv
+.venv/
+venv/
+
+# 本地环境与密钥
+.env
+.env.*
+!.env.example
+
+# 运行产物
+.artifacts/
+runs/
+reports/
+*.log
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 数据集原始 PDF（体积大，不随仓库分发；人工校验文本见 datasets/longdoc-gold/）
+datasets/**/raw/
+datasets/**/*.pdf
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
