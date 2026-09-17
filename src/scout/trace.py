@@ -38,6 +38,10 @@ class StepKind(str, Enum):
     GENERATE = "generate"
     VERIFY = "verify"
     RECOVER = "recover"
+    HUMAN = "human"
+    """人工介入（审批/编辑/复核）。单独成类是因为它的耗时不在系统内，
+    把"等人"的时间混进"处理"的时间会让性能指标失真。——评测里按 kind 分组时
+    应当把它单独列出来，或者默认排除。"""
 
 
 def redact(value: Any) -> Any:

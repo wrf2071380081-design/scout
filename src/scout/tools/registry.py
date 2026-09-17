@@ -65,13 +65,25 @@ ToolHandler = Callable[[Mapping[str, Any]], ToolResult]
 
 @dataclass(slots=True)
 class ToolSpec:
-    """工具定义。"""
+    """工具定义。
+
+    ``side_effects`` / ``compensator`` 是 HITL 审批机制的声明性来源：
+    策略层不需要知道"这个工具内部做了什么"，只要知道**它对世界有改变**、
+    **以及能不能被撤销**，就足以决定要不要打扰人。
+    把这两件事写在工具定义里，等于让"风险"跟着能力走，而不是靠人脑背。
+    """
 
     name: str
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
     enabled: bool = True
+    side_effects: bool = False
+    """True 表示该工具会改变外部状态（写文件、发消息、建工单等），需要纳入审批范围。"""
+
+    compensator: str = ""
+    """撤销该工具副作用所用的补偿工具名（如 send_email → recall_email）。
+    空串表示不可补偿——**不可补偿的工具一律走 REQUIRED 级审批**。"""
 
     def schema(self) -> ToolSchema:
         return ToolSchema(name=self.name, description=self.description, parameters=self.parameters)

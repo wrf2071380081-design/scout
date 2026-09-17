@@ -38,10 +38,19 @@ from .evaluation.runner import (
     run_ablation,
     run_evaluation,
 )
-from .llm.scripted import default_client
+from .hitl import (
+    HumanDecision,
+    ResumableAgent,
+    RunStatus,
+    TimeoutPolicy,
+    build_default_policy,
+)
+from .llm.base import LLMResponse, ToolCall
+from .llm.scripted import HeuristicLLM, ScriptedLLM, default_client
 from .memory.store import LayeredMemory
 from .orchestrator.healing import SelfHealingOrchestrator
 from .rag.pipeline import RAGPipeline, build_index
+from .tools.actions import build_action_tools
 from .tools.builtin import build_default_tools
 from .tools.knowledge import KnowledgeSearchTool
 from .tools.registry import ToolRegistry
@@ -196,6 +205,59 @@ def cmd_eval_ablation(args: argparse.Namespace) -> int:
     return 0
 
 
+# —— hitl demo ——
+
+
+def cmd_hitl_demo(args: argparse.Namespace) -> int:
+    """不读数据集，演示中断 → 审批 → 恢复 → 时间旅行的完整闭环。"""
+
+    registry = ToolRegistry([*build_default_tools(), *build_action_tools()])
+
+    send_mail = LLMResponse(
+        tool_calls=[ToolCall(name="send_email", arguments={"to": "boss@example.com", "subject": "周报", "body": "…"})]
+    )
+    agent = ResumableAgent(
+        ScriptedLLM(
+            [
+                send_mail,
+                LLMResponse(content="报告已发出。"),
+                send_mail,  # 分叉后的第二遍会再次触发同一个调用，用于演示幂等回放
+                LLMResponse(content="报告已发出。"),
+            ]
+        ),
+        registry,
+        timeout_policy=TimeoutPolicy.REJECT,
+    )
+
+    first = agent.start("把本周周报发给老板")
+    print(f"1. 启动 → 状态：{first.status.value}")
+    if first.needs_human:
+        request = first.request.to_dict()
+        print(f"2. 触发审批：{request['tool_name']} 风险={request['risk_level']}")
+        print(f"   原因：{request['risk_reason']}")
+
+        decision = HumanDecision(
+            request_id=first.request.request_id, approved=True, decided_by="reviewer"
+        )
+        resumed = agent.resume(first.run_id, decision)
+        print(f"3. 审批通过后恢复 → 状态：{resumed.status.value}  回答：{resumed.answer}")
+
+        # 时间旅行：回到发邮件之前分叉
+        history = agent.history(first.run_id)
+        earliest = min(checkpoint.step for checkpoint in history)
+        forked = agent.run_fork(
+            first.run_id,
+            at_step=earliest,
+            new_run_id=None,
+        )
+        print(f"4. 时间旅行分叉（step {earliest}）→ 新 run：{forked.run_id}")
+        print(
+            "   关键保障：分叉不能重复副作用（效果数 "
+            f"{forked.meta['effects']}，幂等回放 {forked.meta['effects_replayed']} 次）"
+        )
+    return 0
+
+
 # —— 参数解析 ——
 
 
@@ -209,6 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="用内置小语料跑通一次 Agent 问答（无需外部服务）")
     demo.add_argument("--question", default="", help="自定义问题")
     demo.set_defaults(func=cmd_demo)
+
+    hitl = sub.add_parser("hitl", help="HITL 中断/审批/恢复/时间旅行演示")
+    hitl.add_argument("--mode", choices=("demo",), default="demo", help="演示模式")
+    hitl.set_defaults(func=cmd_hitl_demo)
 
     evaluation = sub.add_parser("eval", help="评测相关命令")
     eval_sub = evaluation.add_subparsers(dest="eval_command")
