@@ -148,7 +148,10 @@ def _observe_pipeline(
         answer=result.answer,
         retrieved_chunk_ids=[unit.chunk.chunk_id for unit in result.units],
         retrieved_sources=[unit.chunk.filename for unit in result.units],
-        retrieved_texts=[unit.context_text for unit in result.units],
+        # 评测匹配必须用**原始叶子块文本**，而不是 unit.context_text：
+        # 后者可能已被消毒（neutralize / NFKC / 截断），
+        # 用它来匹配会把"安全措施改变了文本"误报成"检索没命中"。
+        retrieved_texts=[unit.chunk.text for unit in result.units],
         latency_ms=latency_ms,
         step_count=len(result.trace.steps) if result.trace else 0,
         tool_call_count=0,
@@ -194,7 +197,8 @@ def _observe_agent(
         answer=run.answer,
         retrieved_chunk_ids=[unit.chunk.chunk_id for unit in evidence],
         retrieved_sources=[unit.chunk.filename for unit in evidence],
-        retrieved_texts=[unit.context_text for unit in evidence],
+        # 见 _observe_pipeline：匹配用原始叶子块文本，不用可能被消毒改写的 context_text。
+        retrieved_texts=[unit.chunk.text for unit in evidence],
         latency_ms=latency_ms,
         step_count=run.step_count,
         tool_call_count=run.tool_call_count,

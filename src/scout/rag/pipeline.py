@@ -266,9 +266,13 @@ class RAGPipeline:
         rerank_outcome: RerankOutcome | None = None
         if self.config.rerank_enabled:
             with trace.step("rerank", StepKind.RERANK, candidates=len(units)) as step:
+                # 重排只认**检索身份**（叶子块原文），不认包装后的 context_text：
+                # EXPAND 的意图是"检索最小单元仍是叶子块，父块文本只是陪嫁"，
+                # 如果拿父块全文去做词法重排，EXPAND 就会被自己稀释，
+                # 甚至比不上干净的小块——这是消融实验里真实暴露过的问题。
                 rerank_outcome = self.reranker.rerank(
                     query,
-                    [(unit.chunk.chunk_id, unit.context_text) for unit in units],
+                    [(unit.chunk.chunk_id, unit.chunk.text) for unit in units],
                     enabled=True,
                 )
                 score_map = dict(rerank_outcome.ordered)

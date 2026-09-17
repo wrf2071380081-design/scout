@@ -29,6 +29,15 @@ _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _ARITHMETIC = re.compile(r"[\d+\-*/×÷()（）.]{3,}")
 _DATE_WORDS = ("今天", "昨天", "明天", "现在", "日期", "几号", "星期", "时间")
 
+# 问题模板里频繁出现的标志词（自动生成问题或按模板写出来的问题里常见）。
+# 必须和 FUNCTION_WORDS 一样参与过滤：它们在证据里看不到，
+# 会被 IDF 加权成"高权重缺失"，从而把大量本可回答的问题误判成证据不足。
+QUESTION_FILLER_TOKENS = frozenset({
+    "根据", "知识库", "回答", "量化", "方面", "举措", "问题", "请问",
+    "请", "内容", "要求", "怎么回事", "提出", "哪方面", "具体", "怎么做",
+    "理由", "为什么", "是什么", "信息", "解释", "相关", "有关", "想法",
+})
+
 _COMPLEX_MARKERS = (
     "对比", "区别", "分别", "以及", "同时", "综合", "多跳", "影响", "原因和",
     "为什么", "如何影响", "比较", "各自", "之间关系", "跨文档",
@@ -50,10 +59,17 @@ def content_tokens(text: str) -> set[str]:
 
     单词：过滤功能词；双字组：仅当两个字符都是功能词时才过滤
     （避免把"内存""调度"这类由常见字组成的术语误删）。
+
+    另有一层 ``QUESTION_FILLER_TOKENS``：问题模板里频繁出现的标志词
+    （"根据知识库回答""量化目标""要求""方面"……）。这些词在证据里看不到，
+    会被 IDF 加权成"高权重缺失"——实测把大量本可以回答的问题
+    误判成证据不足，是评测 draft 集上 27.7% 误拒的主要根部。
     """
 
     result: set[str] = set()
     for token in tokenize(text):
+        if token in QUESTION_FILLER_TOKENS:
+            continue
         if len(token) == 1:
             if token in FUNCTION_WORDS:
                 continue
