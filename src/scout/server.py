@@ -328,16 +328,40 @@ def _ablation_summary() -> dict[str, Any]:
 
 
 def serve(corpus_dir: str | Path | None = None, *, host: str = "127.0.0.1", port: int = 8765) -> None:
-    """启动控制台。阻塞运行，Ctrl-C 退出。"""
+    """启动控制台。阻塞运行，Ctrl-C 退出。
 
+    启动时会先打印进度再构建索引——索引构建需要十几秒，
+    没有提示的话用户会以为命令卡死了。
+    """
+
+    print(f"正在加载语料并构建索引：{corpus_dir or '（内置小语料）'}", flush=True)
     app = ConsoleApp(corpus_dir)
     ConsoleHandler.app = app
-    server = ThreadingHTTPServer((host, port), ConsoleHandler)
-    print(f"scout console: http://{host}:{port}  (语料 {len(app.documents)} 篇，离线模式)")
+    print(
+        f"语料就绪：{len(app.documents)} 篇 / {len(app.index.chunks)} 块（离线模式，模块 {app.llm.model_name}）",
+        flush=True,
+    )
+
+    # 端口被占用时顺延，而不是直接崩——本地同时开两个实例很常见。
+    server = None
+    last_error: Exception | None = None
+    for candidate in range(port, port + 10):
+        try:
+            server = ThreadingHTTPServer((host, candidate), ConsoleHandler)
+            port = candidate
+            break
+        except OSError as exc:
+            last_error = exc
+            continue
+    if server is None:
+        raise SystemExit(f"无法绑定 {host}:{port}～{port + 9} 之间的端口：{last_error}")
+
+    print(f"scout console 已启动 →  http://{host}:{port}", flush=True)
+    print("（请用浏览器打开上面的地址；不要在编辑器里直接预览 HTML 文件，那样连不上 API）", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\n已停止。", flush=True)
     finally:
         server.server_close()
 
