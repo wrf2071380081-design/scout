@@ -224,17 +224,41 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # 允许跨源调用：页面可能是从磁盘（file://）或其他端口打开的，
+        # 没有这几个头，浏览器会直接拦掉请求——现象就是"拿不到响应"。
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # 浏览器提前断开（比如用户切走了页面）不该在服务端留下噪声栈。
+            pass
 
     def _json(self, payload: dict[str, Any], code: int = 200) -> None:
         self._send(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
+    def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib 接口名
+        """CORS 预检。POST + application/json 会先发 OPTIONS，不回就整个请求失败。"""
+
+        self._send(204, b"")
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib 接口名
+        try:
+            self._route_get()
+        except Exception as exc:  # noqa: BLE001 - 兜底：任何异常都必须变成 JSON，而不是空响应
+            self._json({"error": "internal", "detail": f"{type(exc).__name__}: {exc}"[:300]}, 500)
+
+    def _route_get(self) -> None:
         path = urlparse(self.path).path
         if path in {"/", "/index.html"}:
-            body = (WEB_DIR / "index.html").read_bytes()
-            self._send(200, body, "text/html")
+            html = WEB_DIR / "index.html"
+            if not html.exists():
+                self._json({"error": "ui_missing", "path": str(html)}, 500)
+                return
+            self._send(200, html.read_bytes(), "text/html")
             return
         if path == "/api/health":
             self._json(self.app.health())
@@ -248,20 +272,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._json({"error": "not_found", "path": path}, 404)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib 接口名
+        try:
+            self._route_post()
+        except Exception as exc:  # noqa: BLE001 - 同上：不能让异常穿透成空响应
+            self._json({"error": "internal", "detail": f"{type(exc).__name__}: {exc}"[:300]}, 500)
+
+    def _route_post(self) -> None:
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"
         try:
-            payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
+            payload = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self._json({"error": "invalid_json"}, 400)
             return
-        try:
-            if path == "/api/ask":
-                self._json(self.app.ask(str(payload.get("question", "")), str(payload.get("mode", "pipeline"))))
-            elif path == "/api/action":
-                self._json(self.app.start_action(str(payload.get("question", ""))))
-            elif path == "/api/approve":
+        if path == "/api/ask":
+            self._json(self.app.ask(str(payload.get("question", "")), str(payload.get("mode", "pipeline"))))
+        elif path == "/api/action":
+            self._json(self.app.start_action(str(payload.get("question", ""))))
+        elif path == "/api/approve":
+            try:
                 self._json(
                     self.app.approve(
                         str(payload.get("run_id", "")),
@@ -269,10 +299,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         edited_arguments=payload.get("edited_arguments"),
                     )
                 )
-            else:
-                self._json({"error": "not_found", "path": path}, 404)
-        except (KeyError, ValueError) as exc:
-            self._json({"error": str(exc)}, 400)
+            except KeyError:
+                self._json({"error": "unknown_run", "run_id": payload.get("run_id")}, 404)
+        else:
+            self._json({"error": "not_found", "path": path}, 404)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # 控制台默认静音：本地调试不该被请求日志刷屏。

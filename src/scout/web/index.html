@@ -126,6 +126,15 @@
 
   .empty { color: var(--ink-3); font-size: 12px; padding: 8px 0; }
   .hint { color: var(--ink-3); font-size: 12px; }
+  .banner {
+    margin: 0; padding: 10px 20px; font-size: 13px; line-height: 1.7;
+    background: #fdf7e8; color: #6b4c0a; border-bottom: 1px solid #f0dfb8;
+  }
+  .banner code {
+    background: #fff; border: 1px solid #f0dfb8; border-radius: 4px;
+    padding: 1px 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+  }
+  .banner.bad { background: #fdecea; color: #7d2318; border-bottom-color: #f5c6c0; }
   @media (max-width: 1080px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -141,6 +150,7 @@
     <button id="mMulti">multiagent</button>
   </div>
 </header>
+<div id="banner" class="banner" hidden></div>
 
 <main>
   <!-- 左：提问 -->
@@ -207,6 +217,56 @@ const $ = (id) => document.getElementById(id);
 let mode = "pipeline";
 let currentRun = null;
 
+/* —— 后端地址探测 ——
+   这个页面可能从三种位置打开：
+     1. scout serve 提供的 http://127.0.0.1:8765  → 同源，直接可用
+     2. 作为文件（file://）打开                   → 必须显式指向本地服务
+     3. 被别的静态服务器托管（编辑器预览等）      → 同源没有 /api，需要跨源
+   所以先逐个探测候选地址，探不通就说清楚"该怎么启动"，而不是抛一个
+   `Unexpected end of JSON input` 这种看不懂的错。 */
+const API_CANDIDATES = ["", "http://127.0.0.1:8765", "http://localhost:8765"];
+let apiBase = null;
+
+async function readJson(res) {
+  const text = await res.text();
+  if (!text) throw new Error(`空响应（HTTP ${res.status}）`);
+  try { return JSON.parse(text); }
+  catch (e) { throw new Error(`响应不是 JSON（HTTP ${res.status}）：${text.slice(0, 80)}`); }
+}
+
+async function probeBackend() {
+  for (const base of API_CANDIDATES) {
+    try {
+      const res = await fetch(base + "/api/health", { cache: "no-store" });
+      if (!res.ok) continue;
+      const payload = await readJson(res);
+      if (payload && typeof payload.documents === "number") {
+        apiBase = base;
+        return payload;
+      }
+    } catch (e) { /* 试下一个 */ }
+  }
+  return null;
+}
+
+function showBanner(html, bad) {
+  const el = $("banner");
+  el.innerHTML = html;
+  el.classList.toggle("bad", !!bad);
+  el.hidden = false;
+}
+
+async function api(path, body) {
+  if (apiBase === null) throw new Error("未连接到后端");
+  const opt = body
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    : { cache: "no-store" };
+  const res = await fetch(apiBase + path, opt);
+  const payload = await readJson(res);
+  if (payload && payload.error) throw new Error(payload.detail || payload.error);
+  return payload;
+}
+
 function setMode(m) {
   mode = m;
   $("mPipeline").classList.toggle("on", m === "pipeline");
@@ -225,15 +285,13 @@ $("clr").onclick = () => {
   $("metrics").innerHTML = ""; $("verdict").innerHTML = "";
 };
 
-async function api(path, body) {
-  const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {};
-  const r = await fetch(path, opt);
-  return await r.json();
-}
-
 $("ask").onclick = async () => {
   const q = $("q").value.trim();
   if (!q) return;
+  if (apiBase === null) {
+    $("answer").textContent = "未连接到后端。请先在终端运行：scout serve";
+    return;
+  }
   $("ask").disabled = true; $("ask").textContent = "运行中…";
   try {
     // 带副作用的请求走动作通道（会触发 HITL 审批）
@@ -252,7 +310,7 @@ $("ask").onclick = async () => {
       render(r);
     }
   } catch (e) {
-    $("answer").textContent = "请求失败：" + e;
+    $("answer").textContent = "请求失败：" + (e && e.message ? e.message : e);
   } finally {
     $("ask").disabled = false; $("ask").textContent = "提问";
   }
@@ -311,6 +369,10 @@ function render(r) {
 }
 
 async function refreshPending() {
+  if (apiBase === null) {
+    $("pending").innerHTML = '<div class="empty">未连接后端。</div>';
+    return;
+  }
   const r = await api("/api/pending");
   const items = r.pending || [];
   const box = $("pending");
@@ -348,9 +410,30 @@ async function refreshPending() {
 }
 
 async function boot() {
-  const h = await api("/api/health");
-  $("chipCorpus").textContent = "语料 " + h.documents + " 篇 / " + h.chunks + " 块";
-  $("chipModel").textContent = "model " + h.model;
+  const health = await probeBackend();
+  if (health === null) {
+    showBanner(
+      '⚠️ <b>未连接到 scout 后端。</b>这个页面需要本地服务才能工作：' +
+      '先在终端执行 <code>scout serve</code>，' +
+      '然后打开 <code>http://127.0.0.1:8765</code>（不要直接双击 HTML 文件）。' +
+      '若服务已启动但端口不同，用 <code>scout serve --port 8765</code> 保持一致。',
+      true,
+    );
+    $("chipCorpus").textContent = "语料 —";
+    $("chipModel").textContent = "model —";
+    $("ablation").innerHTML = "<tr><td style='color:#8b949e'>未连接后端</td></tr>";
+    $("pending").innerHTML = '<div class="empty">未连接后端。</div>';
+    return;
+  }
+  $("chipCorpus").textContent = "语料 " + health.documents + " 篇 / " + health.chunks + " 块";
+  $("chipModel").textContent = "model " + health.model;
+  if (apiBase !== "") {
+    showBanner(
+      'ℹ️ 已连接到 <code>' + apiBase + '</code>（跨源模式）。' +
+      '直接用 <code>http://127.0.0.1:8765</code> 打开本页面体验更完整。',
+      false,
+    );
+  }
   const a = await api("/api/ablation");
   const names = {
     baseline_dense_only: "仅稠密（最大杠杆）", "-rerank": "关掉重排",
