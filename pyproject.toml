@@ -37,6 +37,9 @@ packages = ["src/scout"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+markers = [
+  "slow: 需要下载模型权重或耗时较长的用例（默认跳过，用 -m slow 运行）",
+]
 
 [tool.ruff]
 line-length = 100

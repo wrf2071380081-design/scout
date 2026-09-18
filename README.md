@@ -14,7 +14,8 @@ scout 不只是"能回答问题的 RAG"。它把三件事放进同一个运行�
 
 ```bash
 git clone <this-repo> && cd scout
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # 若安装失败，可直接用 python -m scout.cli
+scout doctor        # 体检：哪些部件是真实模型，哪些还是离线替身
 scout demo          # 不联网、不需要 API Key，直接跑通一次 Agent 问答
 scout eval run      # 在真实长文档语料上跑一次完整评测
 scout eval ablation # 跑模块级消融，产出边际贡献对照表
@@ -22,6 +23,49 @@ scout hitl          # 演示中断 → 审批 → 恢复 → 时间旅行的完�
 scout serve         # 启动 Web 控制台（链路透视 + 审批台）
 scout mcp           # 以 MCP Server 运行，供任意 Agent 客户端接入
 ```
+
+> 如果 `scout` 提示"不是内部或外部命令"，说明包没装上（例如 editable 构建在这台机器上失败）。
+> 等价写法是 `python -m scout.cli <子命令>`，它不依赖 PATH，永远可用。
+
+## 从离线替身切换到真实模型
+
+项目默认可以完全离线跑（这是为了**可复现**：克隆下来不装权重、不配密钥就能复现每一份报告）。
+但离线实现是**基线**，不是能力本身。切换只需要环境变量：
+
+```bash
+# ① 真实向量器（语义检索）——不需要任何 API Key
+pip install fastembed
+set SCOUT_EMBED_BACKEND=local          # 默认模型 BAAI/bge-small-zh-v1.5（512 维 / ~90MB）
+# 国内网络加一句走镜像：
+set HF_ENDPOINT=https://hf-mirror.com
+
+# ② 真实 LLM——任选一个 OpenAI 兼容网关
+set SCOUT_LLM_BASE_URL=https://api.deepseek.com/v1
+set SCOUT_LLM_API_KEY=sk-xxxx
+set SCOUT_LLM_MODEL=deepseek-chat
+
+scout doctor                            # 确认两项都变成 ✅
+```
+
+| 部件 | 离线替身 | 真实实现 | 切换方式 |
+|---|---|---|---|
+| 向量器 | `HashingEmbedder`（词法哈希） | `LocalEmbedder`（fastembed / BGE）｜`OpenAICompatEmbedder` | `SCOUT_EMBED_BACKEND=local\|openai` |
+| LLM | `HeuristicLLM`（词法抽取） | `OpenAICompatLLM` | `SCOUT_LLM_BASE_URL` |
+
+**`scout doctor` 会明确告诉你现在生效的是哪一种**，并把不可达的网关标出来。
+这不是客套——把离线基线的分数当成真实水平，是这类项目最容易犯也最难被发现的错。
+
+> 语义向量与词法向量的差距是实测出来的（`scripts/` 下可复现）：
+> 同义改写句 `Redis 为什么这么快` ↔ `Redis 高性能的原因是什么`，
+> 语义模型余弦 **0.645**，哈希向量只有 **0.293**；
+> 而无关句（`今天天气怎么样`）语义模型给 **0.394**、哈希给 **0.118**。
+> 语义模型能拉开"相关/不相关"，词法向量拉不开。
+>
+> **但换模型必须匹配语料语言。** 在英文基准 MuSiQue 上换成中文模型
+> `bge-small-zh-v1.5` 之后，Recall@5 **没有变化（±0.0pp）**，纯稠密通道反而
+> 掉了 2.9pp——中文模型编码英文段落发挥不出语义优势。
+> 完整对照与归因见 [`evals/results/musique_bench_semantic.md`](evals/results/musique_bench_semantic.md)。
+> **这个负向结论我保留在报告里，没有删掉换成更好看的数字。**
 
 > **关于 Web 控制台**：`scout serve` 会打印出访问地址（默认 `http://127.0.0.1:8765`），
 > **请用浏览器打开那个地址**。不要双击或在编辑器里直接预览 `src/scout/web/index.html`——
@@ -444,6 +488,7 @@ export SCOUT_SUFFICIENCY_MIN_FOCUS_COVERAGE=0.5
 - [x] 公开基准：MuSiQue-Ans 300 条冻结样本 + bootstrap 95% CI（含配对消融）
 - [x] MCP：stdio MCP Server（零依赖），暴露检索/问答/统计三个工具
 - [x] 沙箱：python_exec（子进程 + 拦截 + 超时 + 自动升级为必须人审）
+- [x] 真实模型：本地语义向量（fastembed / BGE-zh）+ OpenAI 兼容 LLM，`scout doctor` 体检
 - [x] 故障注入：8 类注入故障下类型化失败率与恢复率均为 100%（找出并修复 2 处生产级 bug）
 - [x] 语料：40 篇长文档 + 200 条标注草稿
 - [ ] 人工审 v2 草稿（提升 200 题质量）

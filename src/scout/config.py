@@ -45,6 +45,31 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingSettings:
+    """向量器配置。
+
+    ``backend`` 的四种取值：
+
+    - ``auto``（默认）：装了 fastembed 就用本地语义模型，否则退回哈希向量器
+    - ``local``：强制本地语义模型（``BAAI/bge-small-zh-v1.5``，约 90MB，CPU 可跑）
+    - ``openai``：走 OpenAI 兼容 ``/embeddings`` 接口
+    - ``hashing``：强制离线哈希向量器（评测基线与单元测试）
+
+    与 ``LLMSettings`` 的区别值得说明：LLM **可以**离线退化（启发式实现也能产出结构化输出），
+    但向量器一旦退化，检索就从"语义"变成"词法"，这是**质量层面的降级而不是可用性层面的降级**。
+    所以这里提供 :func:`scout.rag.embed.embedder_status` 把当前真实生效的后端暴露出来，
+    并进入评测报告的 environment 段——**降级可以被看见，才不会被误当成真实结果。**
+    """
+
+    backend: str = "auto"
+    model: str = "BAAI/bge-small-zh-v1.5"
+    base_url: str = ""
+    api_key: str = ""
+    dim: int = 0
+    cache_dir: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class LLMSettings:
     """LLM 客户端配置。
 
@@ -150,6 +175,7 @@ class Settings:
     """聚合配置。"""
 
     llm: LLMSettings = field(default_factory=LLMSettings)
+    embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
     chunking: ChunkSettings = field(default_factory=ChunkSettings)
     retrieval: RetrievalSettings = field(default_factory=RetrievalSettings)
     agent: AgentSettings = field(default_factory=AgentSettings)
@@ -159,6 +185,14 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
+            embedding=EmbeddingSettings(
+                backend=_env_str("SCOUT_EMBED_BACKEND", "auto"),
+                model=_env_str("SCOUT_EMBED_MODEL", "BAAI/bge-small-zh-v1.5"),
+                base_url=_env_str("SCOUT_EMBED_BASE_URL", ""),
+                api_key=_env_str("SCOUT_EMBED_API_KEY", ""),
+                dim=_env_int("SCOUT_EMBED_DIM", 0),
+                cache_dir=_env_str("SCOUT_EMBED_CACHE_DIR", ""),
+            ),
             llm=LLMSettings(
                 base_url=_env_str("SCOUT_LLM_BASE_URL", ""),
                 api_key=_env_str("SCOUT_LLM_API_KEY", ""),

@@ -280,8 +280,97 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from .server import serve
 
     corpus = args.corpus or str(Path(__file__).resolve().parents[2] / "datasets" / "longdoc-gold")
-    serve(corpus, host=args.host, port=args.port)
+    serve(corpus, host=args.host, port=args.port, embed_backend=getattr(args, "embed", "auto"))
     return 0
+
+
+# —— doctor ——
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """体检：报告当前哪些部件是"真实模型"，哪些还是离线替身。
+
+    这个命令存在的理由：**"跑通了"和"跑的是真东西"是两件事。**
+    离线实现让项目可复现，但它不是能力本身。如果不把"现在生效的是哪一种"
+    明确打印出来，很容易把离线基线的分数当成真实水平——那是最坏的结果。
+    """
+
+    from urllib.parse import urlparse
+
+    from .rag.embed import embedder_status
+
+    settings = get_settings()
+    client = default_client()
+    status = embedder_status(settings)
+    ok = True
+
+    print(f"scout {scout.__version__} 环境体检")
+    print("=" * 56)
+
+    # —— LLM ——
+    llm_real = settings.llm.configured
+    print(f"[LLM]      {'✅ 真实模型' if llm_real else '⚠️  离线启发式'}")
+    print(f"           客户端 : {client.model_name}")
+    if llm_real:
+        host = urlparse(settings.llm.base_url).netloc or settings.llm.base_url
+        print(f"           网关   : {host}")
+        print(f"           密钥   : {'已配置' if settings.llm.api_key else '未配置（部分网关必需）'}")
+        print(f"           可达性 : {'可达' if _tcp_ok(host) else '不可达（检查网络/代理）'}")
+    else:
+        print("           未配置 SCOUT_LLM_BASE_URL → 回答由词法启发式生成，质量不代表真实水平")
+        ok = False
+
+    # —— 向量器 ——
+    semantic = bool(status["semantic"])
+    print(f"[向量器]   {'✅ 语义向量' if semantic else '⚠️  离线哈希（词法，非语义）'}")
+    print(f"           后端   : {status['configured_backend']} → 生效 {status['resolved_backend']}")
+    print(f"           模型   : {status['local_model']}")
+    print(f"           本地能力: {status['local_detail']}")
+    if not semantic:
+        print("           启用方式: pip install fastembed   然后 set SCOUT_EMBED_BACKEND=local")
+        ok = False
+
+    # —— 语料与数据 ——
+    root = Path(__file__).resolve().parents[2]
+    corpus = root / "datasets" / "longdoc-gold"
+    musique = root / "datasets" / "musique_ans_dev.jsonl"
+    print(f"[语料]     {'✅' if corpus.exists() else '❌'} 长文档语料 {corpus}")
+    print(f"[公开基准] {'✅' if musique.exists() else '⚠️  未下载'} MuSiQue-Ans {musique.name}")
+    if not musique.exists():
+        print("           下载: 见 scripts/bench_musique.py 顶部说明")
+
+    # —— 可选依赖 ——
+    print("[依赖]")
+    for module, hint in [
+        ("requests", "LLM/向量 HTTP 调用"),
+        ("pydantic", "结构化输出解析"),
+        ("fastembed", "本地语义向量（可选）"),
+        ("pytest", "测试（可选）"),
+    ]:
+        try:
+            __import__(module)
+            print(f"           ✅ {module:<12} {hint}")
+        except ImportError:
+            print(f"           ⚪ {module:<12} {hint} — 未安装")
+
+    print("=" * 56)
+    if ok:
+        print("结论：LLM 与向量器都已是真实模型，评测结果可直接对外汇报。")
+    else:
+        print("结论：**当前仍在部分离线模式**。上面的 ⚠️ 项决定结果能否代表真实水平。")
+    return 0 if ok else 1
+
+
+def _tcp_ok(host: str, port: int = 443, timeout: float = 3.0) -> bool:
+    import socket
+
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 # —— 参数解析 ——
@@ -294,8 +383,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("info", help="打印当前配置与可用工具").set_defaults(func=cmd_info)
 
+    sub.add_parser("doctor", help="体检：哪些部件是真实模型，哪些还是离线替身").set_defaults(func=cmd_doctor)
+
     demo = sub.add_parser("demo", help="用内置小语料跑通一次 Agent 问答（无需外部服务）")
     demo.add_argument("--question", default="", help="自定义问题")
+    demo.add_argument(
+        "--embed",
+        choices=("auto", "local", "hashing", "openai"),
+        default=argparse.SUPPRESS,
+        help="向量器后端（默认读取 SCOUT_EMBED_BACKEND，auto=有 fastembed 就用本地语义模型）",
+    )
     demo.set_defaults(func=cmd_demo)
 
     hitl = sub.add_parser("hitl", help="HITL 中断/审批/恢复/时间旅行演示")
@@ -310,6 +407,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--corpus", default="", help="语料目录，默认 datasets/longdoc-gold")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument(
+        "--embed",
+        choices=("auto", "local", "hashing", "openai"),
+        default="auto",
+        help="向量器后端；local=本地语义向量（需 fastembed）",
+    )
     serve.set_defaults(func=cmd_serve)
 
     evaluation = sub.add_parser("eval", help="评测相关命令")

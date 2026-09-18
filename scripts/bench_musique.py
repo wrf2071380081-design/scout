@@ -228,10 +228,11 @@ def run_config(
     documents: list[tuple[str, str]],
     mode: str,
     settings: Settings,
+    embed_backend: str = "auto",
 ) -> dict[str, Any]:
     """跑一种配置，返回每条样本的指标。"""
 
-    index = build_index(documents, settings=settings)
+    index = build_index(documents, settings=settings, embed_backend=embed_backend)
     pipeline = RAGPipeline(index, HeuristicLLM(), settings=settings, config=CONFIGS[mode]())
     per_case: list[dict[str, Any]] = []
     started = time.time()
@@ -257,6 +258,7 @@ def run_config(
         "duration_s": time.time() - started,
         "corpus_docs": len(documents),
         "chunks": len(index.chunks),
+        "embedder": index.embedder.name,
     }
 
 
@@ -289,6 +291,8 @@ def render(summaries: list[dict[str, Any]], runs: dict[str, dict[str, Any]], lim
         f"- 样本数：**{summaries[0]['n']}**（前 {limit} 条含支撑段落的样本）",
         f"- 语料规模：{runs[summaries[0]['mode']]['corpus_docs']} 个段落（所有样本段落的并集）"
         f" → {runs[summaries[0]['mode']]['chunks']} 个块",
+        f"- 向量器：**{runs[summaries[0]['mode']]['embedder']}**"
+        f"{'（语义向量）' if 'hashing' not in runs[summaries[0]['mode']]['embedder'] else '（词法哈希，非语义基线）'}",
         "- 统计方法：**bootstrap 百分位法**，1000 次重采样，95% 置信区间",
         "- 检索设定：每个问题都要在**包含其他问题段落的大池子**里检索（更严格的设定）",
         "",
@@ -346,6 +350,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="在 MuSiQue-Ans 上评测 scout")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--configs", default="full,dense")
+    parser.add_argument(
+        "--embed",
+        choices=("auto", "local", "hashing", "openai"),
+        default="auto",
+        help="向量器后端；local=本地语义模型（BAAI/bge-small-zh-v1.5）",
+    )
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -356,21 +366,22 @@ def main() -> int:
     )
 
     samples, documents = load_musique(args.limit)
-    print(f"样本 {len(samples)} 条 / 段落 {len(documents)} 个，开始评测…", flush=True)
+    print(f"样本 {len(samples)} 条 / 段落 {len(documents)} 个，向量器={args.embed}，开始评测…", flush=True)
 
     runs: dict[str, dict[str, Any]] = {}
     summaries: list[dict[str, Any]] = []
     for mode in [item.strip() for item in args.configs.split(",") if item.strip()]:
         if mode not in CONFIGS:
             raise SystemExit(f"未知配置：{mode}（可选 {', '.join(CONFIGS)}）")
-        run = run_config(samples, documents, mode, settings)
+        run = run_config(samples, documents, mode, settings, args.embed)
         runs[mode] = run
         summary = summarise(run)
         summaries.append(summary)
         print(
             f"  {mode}: Recall@5 {summary['recall@5']['mean']:.1f}% "
             f"CI[{summary['recall@5']['ci95'][0]:.1f}, {summary['recall@5']['ci95'][1]:.1f}] "
-            f"| F1 {summary['answer_f1']['mean']:.1f}% | {run['duration_s']:.1f}s",
+            f"| F1 {summary['answer_f1']['mean']:.1f}% | {run['duration_s']:.1f}s"
+            f" | embedder={run['embedder']}",
             flush=True,
         )
 

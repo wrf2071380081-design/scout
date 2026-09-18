@@ -100,6 +100,89 @@ class HashingEmbedder:
         return [self._vectorize(text) for text in texts]
 
 
+class LocalEmbedder:
+    """本地 ONNX 向量模型（通过 fastembed 加载，无需 torch、无需 API key）。
+
+    默认用 ``BAAI/bge-small-zh-v1.5``：中文优化、512 维、约 90MB，
+    在 CPU 上足够快。首次使用时下载权重（可配合 ``HF_ENDPOINT=https://hf-mirror.com``）。
+
+    **为什么用 fastembed 而不是 sentence-transformers**：
+    后者会拖进 torch（CPU 版也要数百 MB 到 GB 级），
+    而 fastembed 走 ONNX Runtime，安装体积小一个数量级，CPU 推理也更快。
+    本项目只做推理、不训练，没有理由为它装一个深度学习框架。
+
+    依赖是可选的：没装 fastembed 时 :func:`default_embedder` 会退回哈希向量器，
+    而不是让整个包导入失败。
+    """
+
+    DEFAULT_MODEL = "BAAI/bge-small-zh-v1.5"
+    _DIM_BY_MODEL = {
+        "BAAI/bge-small-zh-v1.5": 512,
+        "BAAI/bge-small-en-v1.5": 384,
+        "BAAI/bge-small-en": 384,
+        "jinaai/jina-embeddings-v2-base-zh": 768,
+        "intfloat/multilingual-e5-large": 1024,
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
+    }
+
+    def __init__(self, model_name: str = DEFAULT_MODEL, *, cache_dir: str = "", threads: int | None = None) -> None:
+        self.model_name = model_name
+        self.cache_dir = cache_dir or None
+        self.threads = threads
+        self._model = None
+        self._dim = self._DIM_BY_MODEL.get(model_name, 0)
+
+    # —— 惰性加载：导入 scout 时不应触发模型下载 ——
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from fastembed import TextEmbedding
+        except ImportError as exc:  # pragma: no cover - 取决于可选依赖
+            raise ProviderError(
+                "未安装 fastembed，无法使用本地向量模型。安装：pip install fastembed",
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                retryable=False,
+                provider=self.model_name,
+                operation="embedding",
+            ) from exc
+        kwargs: dict[str, object] = {"model_name": self.model_name}
+        if self.cache_dir:
+            kwargs["cache_dir"] = self.cache_dir
+        if self.threads:
+            kwargs["threads"] = self.threads
+        try:
+            self._model = TextEmbedding(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - 下载/加载失败都归为 provider 不可用
+            raise ProviderError(
+                f"加载本地向量模型失败（{self.model_name}）：{exc}",
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                retryable=True,
+                provider=self.model_name,
+                operation="embedding",
+            ) from exc
+        return self._model
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def name(self) -> str:
+        return self.model_name
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        model = self._ensure_model()
+        vectors = [l2_normalize([float(value) for value in vector]) for vector in model.embed(list(texts))]
+        if vectors and self._dim != len(vectors[0]):
+            # 以实际输出为准：模型元数据可能与预期不符，静默用错维度比报错更糟。
+            self._dim = len(vectors[0])
+        return vectors
+
+
 class OpenAICompatEmbedder:
     """对接 OpenAI 兼容 ``/embeddings`` 接口。"""
 
@@ -222,4 +305,88 @@ class OpenAICompatEmbedder:
         )
 
 
-__all__ = ["Embedder", "HashingEmbedder", "OpenAICompatEmbedder", "cosine", "l2_normalize"]
+def default_embedder(settings: object | None = None, *, backend: str = "auto") -> Embedder:
+    """按配置选择向量器。
+
+    ``backend``：
+    - ``auto``（默认）：装了 fastembed 就用本地语义模型，否则退回哈希向量器。
+    - ``local``：强制本地语义模型（未安装则抛可读错误，而不是静默降级）。
+    - ``openai``：走 OpenAI 兼容 ``/embeddings`` 接口（需要 base_url）。
+    - ``hashing``：强制离线哈希向量器（评测基线与单元测试用）。
+
+    设计原则：**降级要显式**。``auto`` 允许降级但会通过 :func:`embedder_status`
+    把"你现在跑的是哪一种"暴露给调用方；``local``/``openai`` 则不降级——
+    因为用户明确要求了真实模型，静默退回词法向量会让实验结果变得不可解释。
+    """
+
+    from ..config import get_settings
+
+    effective = settings or get_settings()
+    embedding = getattr(effective, "embedding", None)
+    resolved = backend if backend != "auto" else getattr(embedding, "backend", "auto")
+
+    if resolved == "hashing":
+        return HashingEmbedder()
+
+    if resolved == "openai" or (embedding is not None and getattr(embedding, "base_url", "")):
+        return OpenAICompatEmbedder(
+            base_url=getattr(embedding, "base_url", ""),
+            api_key=getattr(embedding, "api_key", ""),
+            model=getattr(embedding, "model", "text-embedding-3-small"),
+            dim=int(getattr(embedding, "dim", 1024) or 1024),
+        )
+
+    if resolved in {"auto", "local"}:
+        model_name = getattr(embedding, "model", "") or LocalEmbedder.DEFAULT_MODEL
+        try:
+            return LocalEmbedder(model_name)
+        except Exception:  # noqa: BLE001 - auto 模式下允许降级
+            if resolved == "local":
+                raise
+            return HashingEmbedder()
+
+    return HashingEmbedder()
+
+
+def embedder_status(settings: object | None = None) -> dict[str, object]:
+    """报告向量器能力现状。供 ``scout doctor`` 与评测报告的 environment 段使用。"""
+
+    from ..config import get_settings
+
+    effective = settings or get_settings()
+    embedding = getattr(effective, "embedding", None)
+    backend = getattr(embedding, "backend", "auto")
+    model = getattr(embedding, "model", "") or LocalEmbedder.DEFAULT_MODEL
+    try:
+        import fastembed  # noqa: F401
+
+        local_available = True
+        local_detail = "fastembed 已安装"
+    except ImportError:
+        local_available = False
+        local_detail = "未安装 fastembed（pip install fastembed 即可启用本地语义向量）"
+
+    resolved = backend
+    if backend == "auto":
+        resolved = "local" if local_available else "hashing"
+    return {
+        "configured_backend": backend,
+        "resolved_backend": resolved,
+        "local_model": model,
+        "local_available": local_available,
+        "local_detail": local_detail,
+        "remote_base_url": getattr(embedding, "base_url", "") or "",
+        "semantic": resolved in {"local", "openai"},
+    }
+
+
+__all__ = [
+    "Embedder",
+    "HashingEmbedder",
+    "LocalEmbedder",
+    "OpenAICompatEmbedder",
+    "cosine",
+    "default_embedder",
+    "embedder_status",
+    "l2_normalize",
+]

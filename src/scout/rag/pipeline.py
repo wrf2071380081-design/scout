@@ -524,18 +524,24 @@ def build_index(
     *,
     settings: Settings | None = None,
     embedder: Any = None,
+    embed_backend: str = "auto",
 ) -> HybridIndex:
     """便捷构造：``documents`` 为 ``[(filename, text), ...]``。
 
     评测脚本与测试都走这个入口，保证"索引构建方式"只有一处定义——
     否则不同脚本各建一次索引，报告之间就不可比。
+
+    ``embedder`` 显式传入时优先；否则按 ``embed_backend`` 解析
+    （``auto`` 会在装了 fastembed 时启用本地语义向量模型）。
+    注意：单元测试传的是显式 embedder 或默认 ``auto``——
+    而 ``auto`` 在没有 fastembed 的环境里退回哈希向量器，因此测试保持确定性。
     """
 
-    from .embed import HashingEmbedder
+    from .embed import default_embedder
 
     effective = settings or get_settings()
     index = HybridIndex(
-        embedder=embedder or HashingEmbedder(),
+        embedder=embedder or default_embedder(effective, backend=embed_backend),
         settings=effective.retrieval,
     )
     for position, (filename, text) in enumerate(documents):

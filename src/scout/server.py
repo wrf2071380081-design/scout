@@ -83,7 +83,13 @@ class _ActionScriptLLM:
 class ConsoleApp:
     """控制台的运行状态：索引、流水线、待审批的运行。"""
 
-    def __init__(self, corpus_dir: str | Path | None = None, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        corpus_dir: str | Path | None = None,
+        settings: Settings | None = None,
+        *,
+        embed_backend: str = "auto",
+    ) -> None:
         self.settings = settings or get_settings()
         self.documents: list[tuple[str, str]] = []
         if corpus_dir:
@@ -92,7 +98,7 @@ class ConsoleApp:
                 self.documents = load_corpus(path)
         if not self.documents:
             self.documents = list(_FALLBACK_CORPUS)
-        self.index = build_index(self.documents, settings=self.settings)
+        self.index = build_index(self.documents, settings=self.settings, embed_backend=embed_backend)
         self.llm = default_client()
         self.pipeline = RAGPipeline(self.index, self.llm, settings=self.settings)
         self.orchestrator = MultiAgentOrchestrator(self.pipeline, self.llm, settings=self.settings)
@@ -208,12 +214,15 @@ class ConsoleApp:
         return self._run_payload(resumed)
 
     def health(self) -> dict[str, Any]:
+        semantic = self.index.embedder.name != "hashing-256" and not self.index.embedder.name.startswith("hashing")
         return {
             "documents": len(self.documents),
             "chunks": len(self.index.chunks),
             "corpus_fingerprint": corpus_fingerprint(self.documents)[:16],
             "model": self.llm.model_name,
-            "offline": True,
+            "embedder": self.index.embedder.name,
+            "semantic_retrieval": bool(semantic),
+            "offline": not self.settings.llm.configured,
         }
 
 
@@ -327,18 +336,25 @@ def _ablation_summary() -> dict[str, Any]:
     }
 
 
-def serve(corpus_dir: str | Path | None = None, *, host: str = "127.0.0.1", port: int = 8765) -> None:
+def serve(
+    corpus_dir: str | Path | None = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    embed_backend: str = "auto",
+) -> None:
     """启动控制台。阻塞运行，Ctrl-C 退出。
 
     启动时会先打印进度再构建索引——索引构建需要十几秒，
     没有提示的话用户会以为命令卡死了。
     """
 
-    print(f"正在加载语料并构建索引：{corpus_dir or '（内置小语料）'}", flush=True)
-    app = ConsoleApp(corpus_dir)
+    print(f"正在加载语料并构建索引：{corpus_dir or '（内置小语料）'}（向量器={embed_backend}）", flush=True)
+    app = ConsoleApp(corpus_dir, embed_backend=embed_backend)
     ConsoleHandler.app = app
     print(
-        f"语料就绪：{len(app.documents)} 篇 / {len(app.index.chunks)} 块（离线模式，模块 {app.llm.model_name}）",
+        f"语料就绪：{len(app.documents)} 篇 / {len(app.index.chunks)} 块"
+        f"｜模型 {app.llm.model_name}｜向量器 {app.index.embedder.name}",
         flush=True,
     )
 
