@@ -126,6 +126,17 @@
 
   .empty { color: var(--ink-3); font-size: 12px; padding: 8px 0; }
   .hint { color: var(--ink-3); font-size: 12px; }
+  .runlog {
+    margin: 8px 0 12px; padding: 8px 10px; font-size: 12px; line-height: 2.0;
+    background: #f8f9fb; border: 1px solid var(--line); border-radius: 8px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    max-height: 200px; overflow: auto;
+  }
+  .runlog .stage-row { display: flex; gap: 6px; align-items: center; }
+  .runlog .stage-row .nm { color: var(--accent); font-weight: 600; min-width: 82px; }
+  .runlog .stage-row .pl { color: var(--ink-3); }
+  .runlog .stage-row.done .nm { color: var(--ok); }
+  .runlog .stage-row.error .nm { color: var(--bad); }
   .banner {
     margin: 0; padding: 10px 20px; font-size: 13px; line-height: 1.7;
     background: #fdf7e8; color: #6b4c0a; border-bottom: 1px solid #f0dfb8;
@@ -145,6 +156,10 @@
   <span class="chip mono" id="chipCorpus">语料 —</span>
   <span class="chip mono" id="chipModel">model —</span>
   <div class="spacer"></div>
+  <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);cursor:pointer;">
+    <input type="checkbox" id="streamToggle" checked style="accent-color:var(--accent);" />
+    流式
+  </label>
   <div class="seg">
     <button id="mPipeline" class="on">pipeline</button>
     <button id="mMulti">multiagent</button>
@@ -162,6 +177,8 @@
         <button class="btn" id="ask">提问</button>
         <button class="btn ghost" id="clr">清空</button>
       </div>
+      <!-- 运行日志：SSE 阶段事件的实时流水，证明每一步都不是假的 -->
+      <div id="runlog" class="runlog" hidden></div>
       <div class="hint" style="margin-bottom:6px;">示例</div>
       <div class="samples">
         <button data-q="云计算标准体系结构包括哪几个部分？">云计算标准体系结构包括哪几个部分？</button>
@@ -305,16 +322,93 @@ $("ask").onclick = async () => {
       $("stages").innerHTML = "";
       $("evidence").innerHTML = '<div class="empty">动作类请求不返回检索证据。</div>';
       await refreshPending();
+    } else if ($("streamToggle").checked) {
+      await askStream(q);
     } else {
+      logRun("mode", "非流式请求");
       const r = await api("/api/ask", { question: q, mode });
       render(r);
     }
   } catch (e) {
     $("answer").textContent = "请求失败：" + (e && e.message ? e.message : e);
+    logRun("error", e && e.message ? e.message : String(e), "error");
   } finally {
     $("ask").disabled = false; $("ask").textContent = "提问";
   }
 };
+
+function logRun(name, detail, cls) {
+  const box = $("runlog");
+  box.hidden = false;
+  const row = document.createElement("div");
+  row.className = "stage-row" + (cls ? " " + cls : "");
+  row.innerHTML = '<span class="nm"></span><span class="pl"></span>';
+  row.querySelector(".nm").textContent = name;
+  row.querySelector(".pl").textContent = detail || "";
+  box.appendChild(row);
+  box.scrollTop = box.scrollHeight;
+}
+
+const STAGE_MAP = {
+  queued: "排队", retrieve: "检索", grade: "判充分/路由",
+  rewrite: "改写", sanitize: "消毒", generate: "生成",
+  regenerate: "重生成", grounding: "归因校验", done: "完成",
+  plan: "规划", fanout: "扇出", synthesize: "聚合",
+};
+
+async function askStream(q) {
+  $("runlog").innerHTML = "";
+  logRun("queued", mode);
+  const res = await fetch(apiBase + "/api/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: q, mode }),
+  });
+  if (!res.ok || !res.body) throw new Error("流式失败 HTTP " + res.status + "（服务端版本可能过旧，请关闭"流式"开关重试）");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  return new Promise((resolve, reject) => {
+    const pump = () => {
+      reader.read().then(({ done, value }) => {
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const lines = block.split("\n");
+          let eventName = "message", data = "";
+          for (const line of lines) {
+            if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+            else if (line.startsWith("data: ")) data += line.slice(6);
+          }
+          if (!data) continue;
+          let payload;
+          try { payload = JSON.parse(data); } catch (e) { continue; }
+          if (eventName === "stage") {
+            const label = STAGE_MAP[payload.stage] || payload.stage;
+            const detail = Object.keys(payload)
+              .filter((k) => k !== "stage")
+              .map((k) => k + "=" + (typeof payload[k] === "number" ? payload[k] : JSON.stringify(payload[k])))
+              .join(" ");
+            logRun(label, detail, payload.stage === "done" ? "done" : "");
+          } else if (eventName === "result") {
+            render(payload);
+            resolve();
+          } else if (eventName === "error") {
+            $("answer").textContent = "后端错误：" + (payload.detail || payload.error);
+            logRun("error", payload.detail || payload.error, "error");
+            resolve();
+          }
+        }
+        if (done) resolve();
+        else pump();
+      }).catch((err) => { logRun("error", err.message, "error"); reject(err); });
+    };
+    pump();
+  });
+}
 
 function render(r) {
   // 答案（把 [n] 引用高亮）

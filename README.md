@@ -6,11 +6,12 @@ scout 不只是"能回答问题的 RAG"。它把三件事放进同一个运行�
 
 | 支柱 | 能力 | 对应问题 |
 |---|---|---|
-| **测量** | 四层评测（检索/生成/安全/轨迹）+ 16 类查询标签 + 模块级消融 + **公开基准 + 置信区间** | 「我怎么知道某个模块到底有没有用？」 |
+| **测量** | 四层评测（检索/生成/安全/轨迹）+ 16 类查询标签 + 模块级消融 + **公开基准 + 置信区间 + 真实模型对照** | 「我怎么知道某个模块到底有没有用？」 |
 | **恢复** | typed 失败分类 → 恢复动作表 → 预算与指纹抑制 | 「出错了怎么办？会不会死循环？」 |
 | **学习** | 可选证据充分性门控、拒答校准、三层记忆与失效机制 | 「它知道什么时候该说不知道吗？」 |
 | **介入** | 风险分级审批、参数修改、副作用账本、时间旅行 | 「能对外发邮件，能不能先把人审一下？」 |
-| **开放** | stdio MCP Server + 沙箱工具 + Web 控制台 | 「能不能接进别人的 Agent / 让人看见链路？」 |
+| **开放** | stdio MCP Server + 沙箱工具 + Web 控制台 + **SSE 流式问答** | 「能不能接进别人的 Agent / 让人看见链路？」 |
+| **预算** | BudgetedLLM：预扣 + 硬上限 + 结算 | 「一个任务能不能把账单烧穿？」 |
 
 ```bash
 git clone <this-repo> && cd scout
@@ -20,7 +21,7 @@ scout demo          # 不联网、不需要 API Key，直接跑通一次 Agent �
 scout eval run      # 在真实长文档语料上跑一次完整评测
 scout eval ablation # 跑模块级消融，产出边际贡献对照表
 scout hitl          # 演示中断 → 审批 → 恢复 → 时间旅行的完整闭环
-scout serve         # 启动 Web 控制台（链路透视 + 审批台）
+scout serve         # 启动 Web 控制台（链路透视 + 审批台 + SSE 流式问答）
 scout mcp           # 以 MCP Server 运行，供任意 Agent 客户端接入
 ```
 
@@ -156,8 +157,16 @@ src/scout/
 ├── multiagent/
 │   ├── subagent.py     子 Agent：隔离上下文窗口 + 压缩结论上行
 │   └── orchestrator.py 规划 → 扇出 → 合成；失败隔离 + 嵌套深度写死
+├── llm/
+│   ├── base.py          LLM 抽象与协议
+│   ├── openai_compat.py OpenAI 兼容客户端
+│   ├── scripted.py      ScriptedLLM（确定性测试替身）+ HeuristicLLM（离线抽取式）
+│   └── budget.py        BudgetedLLM（预扣 + 硬上限 + 结算）
 ├── mcp/
 │   └── server.py      stdio MCP Server（零依赖）：把检索暴露成标准工具
+├── server.py          /api/ask + /api/stream（SSE）+ /api/action + /api/approve
+├── web/
+│   └── index.html       控制台（链路透视 + HITL 审批台 + SSE 运行日志）
 ├── tools/
 │   ├── sandbox.py     python_exec 沙箱（子进程 + 拦截 + 超时 + 人工审批）
 └── evaluation/
@@ -335,9 +344,73 @@ python scripts/bench_musique.py --limit 300 --configs full,dense,hybrid_norerank
 
 完整报告见 [`evals/results/musique_bench.md`](evals/results/musique_bench.md)。
 
+**真实 LLM 版本**（Kimi K3 + bge 语义向量 + cross-encoder 重排）：
+
+```bash
+python scripts/bench_musique_realllm.py
+```
+
+| 指标 | 均值 | bootstrap 95% CI |
+|---|---|---|
+| Recall@5 | **48.0%** | [39.0, 57.0] |
+| Recall@10 | **53.0%** | [44.0, 62.0] |
+| Answer F1 | 1.9% | [0.9, 3.0] |
+| 作答率 | **24%（12/50）** | — |
+
+> ⚠️ 这里最能说明问题的不是 48%，而是 **24%**：另外 76% 的多跳问题，
+> 系统是**明确拒答，不是勉强编造**。
+> 「不门控时全都能答」跟「门控时知道什么该答」是两件事——
+> 这正是评估里最重要、也最常被掠过的一个决策。
+>
+> 报告见 [`evals/results/musique_bench_realllm.md`](evals/results/musique_bench_realllm.md)。
+
+### cross-encoder 重排（正面交锋报告）
+
+粗排只是 ANN（快、错误率高）；重排接 cross-encoder，是因为它做 Query-Doc 联合建模
+（慢但准）。在 scout 里两者并存：
+
+```python
+from scout.rag.ranking import CrossEncoderReranker, LexicalReranker
+
+cross = CrossEncoderReranker()  # BAAI/bge-reranker-base，中文配套
+```
+
+报告（同一批候选上的逐题对照）：cross-encoder 让 top1→top6 排名更替近一半、
+相关/不相关的分距明显拉开；CPU 延迟实测 ~5s / 20 候选。
+
+### SSE 流式问答：`/api/stream`
+
+请求不再等到最后一刻才出结果——阶段事件（retrieve / grade / rewrite / sanitize /
+generate / grounding / done）**挂在真实断点上**，不是前端伪造的进度条。
+Web 控制台开"流式"开关即可体验，先展示检索、改写、消毒、生成、归因校验
+每一步的真实负载，再一次性给出完整答案。
+
+```bash
+curl -N -X POST http://127.0.0.1:8765/api/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question": "云计算标准体系结构包括哪几个部分？", "mode": "pipeline"}'
+```
+
+### 预算管控（预扣 + 硬上限 + 结算）
+
+```python
+from scout.llm.budget import BudgetedLLM
+
+budgeted = BudgetedLLM(real_client, budget_tokens=30_000, reserve_estimate=20_000)
+try:
+    response = budgeted.complete(request)   # 余额不足时在这里被类型化拒绝
+except BudgetExceededError:
+    ...  # 任务在预算耗尽的那一刻被截停，而不是跑完才透支
+settlement = budgeted.settle()              # 冻结 vs 实际，一笔清账
+```
+
+并发下的两个大坑这个模块都盯着：超扣（竞态下超额扣减）
+与占用不释放（先扣后失败，额度长期被占）。
+要把"冻结"和"实际"分开存，这就是原因。
+
 ---
 
-## 实测结果（含负向结论）
+## 从离线替身切换到真实模型（工程映射）
 
 语料：`datasets/longdoc-gold/`，40 篇公开长文档（20 篇 A 股年报摘要 + 20 篇政策/标准），
 切分后 **988 个叶子块**。标注集：`evals/longdoc_v1.json`，19 条样本覆盖 14 类标签。
@@ -438,8 +511,9 @@ python scripts/bench_musique.py --limit 300 --configs full,dense,hybrid_norerank
    它的定位是让流程**可复现**，不是**能打**。生产请配置真实模型。
 3. **哈希向量器是词法信号，不是语义向量。** 它的检索质量显著低于 BGE 等模型，
    但保证了"克隆即可跑"。换向量器只需替换一个类。
-4. **索引是单机内存实现**，重排器是词法占位实现。生产应换成向量数据库
-   与跨编码器，接口形状不变。
+4. **索引是单机内存实现**。生产应换成向量数据库（Weaviate / Milvus等），
+   接口形状不变。重排器默认是词法，装了 fastembed 就换成真正的 cross-encoder
+   （默认 `BAAI/bge-reranker-base`，中文）。
 5. **充分性判定仍会漏判**（见上文 50%）。纯词法手段难以可靠区分
    "主题词重叠"与"真的能回答"，根治需要模型侧判断。
 6. **轨迹学习（trace → 偏好对 → DPO）尚未实现**，目前只有 trace 采集与失败分类。
@@ -451,12 +525,18 @@ python scripts/bench_musique.py --limit 300 --configs full,dense,hybrid_norerank
 所有参数走环境变量，全部有安全默认值。常用项：
 
 ```bash
-# 切换到真实模型（不配置则使用离线确定性实现）
-export SCOUT_LLM_BASE_URL="https://api.openai.com/v1"
+# ★ 真实模型（需要它们才算"在跑真东西"）
+export SCOUT_LLM_BASE_URL="https://api.deepseek.com/v1"
 export SCOUT_LLM_API_KEY="sk-..."
-export SCOUT_LLM_MODEL="gpt-4o-mini"
+export SCOUT_LLM_MODEL="deepseek-chat"
+
+export SCOUT_EMBED_BACKEND="local"          # 启动本地语义向量（需 fastembed）
+export SCOUT_EMBED_MODEL="BAAI/bge-small-zh-v1.5"
+export SCOUT_RERANK_BACKEND="cross"          # 启动 cross-encoder 重排
+export SCOUT_RERANK_MODEL="BAAI/bge-reranker-base"
 
 # Agent 预算
+
 export SCOUT_AGENT_MAX_STEPS=8
 export SCOUT_AGENT_MAX_TOOL_CALLS=12
 export SCOUT_AGENT_DEADLINE_SECONDS=120

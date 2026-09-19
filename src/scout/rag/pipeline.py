@@ -46,7 +46,7 @@ from ..verify.grounding import GroundingReport, Verdict, verify_answer
 from ..verify.sanitize import neutralize, sanitize_text
 from .index import HybridIndex, RetrievalMode, ScoredChunk
 from .merge import EvidenceUnit, MergeMode, MergeOutcome, auto_merge
-from .ranking import LexicalReranker, RerankOutcome
+from .ranking import LexicalReranker, RerankOutcome, default_reranker
 from .rewrite import RewriteAdvisor, RewritePlan, apply_plan
 
 ANSWERED = "answered"
@@ -152,9 +152,11 @@ class RAGPipeline:
         )
         self.index = index
         self.llm: LLMClient = llm or default_client()
-        self.reranker = LexicalReranker(
+        self.reranker = default_reranker(
+            self.settings.retrieval.rerank_backend,
             candidate_limit=max(self.settings.retrieval.top_k * 4, 20),
             min_score=self.settings.retrieval.rerank_min_score,
+            model_name=self.settings.retrieval.rerank_model,
         )
         stats = index.corpus_stats()
         self.advisor = RewriteAdvisor(
@@ -406,8 +408,21 @@ class RAGPipeline:
 
     # —— 主入口 ——
 
-    def answer(self, question: str) -> PipelineResult:
-        """执行一次完整问答。"""
+    def answer(self, question: str, on_stage: Any = None) -> PipelineResult:
+        """执行一次完整问答。
+
+        ``on_stage`` 是可选的阶段回调：签名 ``(stage, payload)``，在每个
+        真实的工作边界上被调用一次——retrieve / grade / rewrite / sanitize /
+        generate / grounding / done。Web 控制台与评测的 SSE 输出就靠它，
+        而不是靠对边界的猜测。**阶段钩子必须落在真实断点上，伪造的阶段比没有更糟。**
+        """
+
+        def emit(stage: str, payload: dict[str, Any]) -> None:
+            if on_stage is not None:
+                try:
+                    on_stage(stage, payload)
+                except Exception:  # noqa: BLE001 - 观察者故障绝不应该中断主流程
+                    pass
 
         trace = Trace(question=question)
         result = PipelineResult(question=question, answer="", outcome=NO_KNOWLEDGE, trace=trace)
@@ -415,11 +430,14 @@ class RAGPipeline:
 
         units, meta, grade = self.collect(question, trace)
         result.meta.update(meta)
+        emit("retrieve", {"units": len(units)})
+        emit("grade", {"answerable": grade.answerable, "route": grade.route, "coverage": round(grade.coverage, 3)})
 
         if not units:
             result.outcome = NO_KNOWLEDGE
             result.answer = ABSTENTION_ANSWER
             result.error_code = NoKnowledgeError.default_code.value
+            emit("done", {"outcome": result.outcome})
             return result
 
         if self.config.rewrite_enabled and grade.route == "rewrite":
@@ -431,6 +449,7 @@ class RAGPipeline:
             result.meta["rewrite_method"] = plan.method.value
             result.meta["rewrite_reason"] = plan.reason
             if plan.triggers:
+                emit("rewrite", {"method": plan.method.value, "reason": plan.reason})
                 rewritten = apply_plan(question, plan)
                 second_units, second_meta, second_grade = self.collect(
                     rewritten, trace, original_question=question
@@ -442,20 +461,24 @@ class RAGPipeline:
 
         units = self._sanitize_units(units, trace)
         result.units = units
+        emit("sanitize", {"units": len(units)})
 
         if grade.route == "clarify" or grade.ambiguous:
             result.outcome = CLARIFY
             result.answer = CLARIFY_ANSWER
             result.error_code = InsufficientEvidenceError.default_code.value
+            emit("done", {"outcome": result.outcome})
             return result
 
         if not grade.answerable:
             result.outcome = INSUFFICIENT
             result.answer = ABSTENTION_ANSWER
             result.error_code = InsufficientEvidenceError.default_code.value
+            emit("done", {"outcome": result.outcome})
             return result
 
         answer = self._generate(question, units, trace)
+        emit("generate", {"chars": len(answer), "regenerations": 0})
         grounding: GroundingReport = verify_answer(
             question,
             answer,
@@ -474,6 +497,7 @@ class RAGPipeline:
             and regenerations < self.config.max_regenerations
         ):
             regenerations += 1
+            emit("regenerate", {"attempt": regenerations})
             with trace.step("regenerate", StepKind.GENERATE, attempt=regenerations) as step:
                 answer = self._generate(question, units, trace, strict=True)
                 step.outputs = {"answer_chars": len(answer)}
@@ -488,17 +512,20 @@ class RAGPipeline:
 
         result.grounding = grounding
         result.meta["regenerations"] = regenerations
+        emit("grounding", {"verdict": grounding.verdict.value, "support_rate": round(grounding.support_rate, 3)})
 
         if self.config.sufficiency_gate and grounding.verdict is Verdict.ABSTAIN:
             result.outcome = INSUFFICIENT
             result.answer = ABSTENTION_ANSWER
             result.error_code = InsufficientEvidenceError.default_code.value
+            emit("done", {"outcome": result.outcome})
             return result
 
         result.answer = answer
         result.outcome = ANSWERED
         result.meta["trace_durations_ms"] = trace.kind_durations()
         result.meta["total_duration_ms"] = trace.total_duration_ms()
+        emit("done", {"outcome": result.outcome, "total_ms": trace.total_duration_ms()})
         return result
 
     def answer_or_raise(self, question: str) -> PipelineResult:

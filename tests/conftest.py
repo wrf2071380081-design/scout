@@ -20,6 +20,8 @@ import os
 
 # 必须在 scout.config 被导入之前设置：get_settings() 会缓存首次读到的环境。
 os.environ.setdefault("SCOUT_EMBED_BACKEND", "hashing")
+# 同理把重排钉死为词法实现，避免测试触发 1GB 级重排模型下载。
+os.environ.setdefault("SCOUT_RERANK_BACKEND", "lexical")
 # 顺带钉死 LLM：不配置 base_url → 走离线启发式实现，测试不触网。
 os.environ.pop("SCOUT_LLM_BASE_URL", None)
 os.environ.pop("SCOUT_LLM_API_KEY", None)

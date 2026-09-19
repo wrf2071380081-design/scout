@@ -117,6 +117,8 @@ class RetrievalSettings:
     auto_merge_enabled: bool = True
     auto_merge_threshold: int = 2
     rerank_enabled: bool = True
+    rerank_backend: str = "auto"
+    rerank_model: str = "BAAI/bge-reranker-base"
     rerank_min_score: float = 0.0
     evidence_budget_chars: int = 12000
     grader_evidence_chars: int = 4800
@@ -217,6 +219,8 @@ class Settings:
                 auto_merge_enabled=_env_bool("SCOUT_AUTO_MERGE_ENABLED", True),
                 auto_merge_threshold=_env_int("SCOUT_AUTO_MERGE_THRESHOLD", 2),
                 rerank_enabled=_env_bool("SCOUT_RERANK_ENABLED", True),
+                rerank_backend=_env_str("SCOUT_RERANK_BACKEND", "auto"),
+                rerank_model=_env_str("SCOUT_RERANK_MODEL", "BAAI/bge-reranker-base"),
                 rerank_min_score=_env_float("SCOUT_RERANK_MIN_SCORE", 0.0),
                 evidence_budget_chars=_env_int("SCOUT_EVIDENCE_BUDGET_CHARS", 12000),
                 grader_evidence_chars=_env_int("SCOUT_GRADER_EVIDENCE_CHARS", 4800),

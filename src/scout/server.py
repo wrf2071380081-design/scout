@@ -115,48 +115,43 @@ class ConsoleApp:
 
     # —— 问答 ——
 
+    # —— 结果构造（/api/ask 与 /api/stream 共用） ——
+
+    def _pipeline_payload(self, result: Any) -> dict[str, Any]:
+        units = result.units
+        payload: dict[str, Any] = {
+            "mode": "pipeline",
+            "answer": result.answer,
+            "outcome": result.outcome,
+            "meta": result.meta,
+            "trace": result.trace.to_dict() if result.trace else None,
+        }
+        payload["evidence"] = _evidence_payload(units)
+        if result.grounding is not None:
+            payload["grounding"] = _grounding_payload(result.grounding)
+        return payload
+
+    def _multiagent_payload(self, result: Any) -> dict[str, Any]:
+        units = result.units
+        payload: dict[str, Any] = {
+            "mode": "multiagent",
+            "answer": result.answer,
+            "outcome": result.outcome,
+            "plan": result.plan,
+            "coverage_gaps": result.coverage_gaps,
+            "subresults": [item.to_dict() for item in result.subresults],
+            "meta": result.meta,
+            "trace": result.trace.to_dict() if result.trace else None,
+        }
+        payload["evidence"] = _evidence_payload(units)
+        if result.grounding is not None:
+            payload["grounding"] = _grounding_payload(result.grounding)
+        return payload
+
     def ask(self, question: str, mode: str = "pipeline") -> dict[str, Any]:
         if mode == "multiagent":
-            result = self.orchestrator.answer(question)
-            units = result.units
-            payload: dict[str, Any] = {
-                "mode": "multiagent",
-                "answer": result.answer,
-                "outcome": result.outcome,
-                "plan": result.plan,
-                "coverage_gaps": result.coverage_gaps,
-                "subresults": [item.to_dict() for item in result.subresults],
-                "meta": result.meta,
-                "trace": result.trace.to_dict() if result.trace else None,
-            }
-        else:
-            result = self.pipeline.answer(question)
-            units = result.units
-            payload = {
-                "mode": "pipeline",
-                "answer": result.answer,
-                "outcome": result.outcome,
-                "meta": result.meta,
-                "trace": result.trace.to_dict() if result.trace else None,
-            }
-        payload["evidence"] = [
-            {
-                "chunk_id": unit.chunk.chunk_id,
-                "filename": unit.chunk.filename,
-                "score": round(unit.score, 4),
-                "level": unit.chunk.level,
-                "text": unit.context_text[:400],
-            }
-            for unit in units[:8]
-        ]
-        if result.grounding is not None:
-            payload["grounding"] = {
-                "verdict": result.grounding.verdict.value,
-                "support_rate": round(result.grounding.support_rate, 4),
-                "coverage": round(result.grounding.coverage, 4),
-                "reason": result.grounding.reason,
-            }
-        return payload
+            return self._multiagent_payload(self.orchestrator.answer(question))
+        return self._pipeline_payload(self.pipeline.answer(question))
 
     # —— 动作与审批 ——
 
@@ -224,6 +219,31 @@ class ConsoleApp:
             "semantic_retrieval": bool(semantic),
             "offline": not self.settings.llm.configured,
         }
+
+
+# —— 结果构造共享帮手 ——
+
+
+def _evidence_payload(units: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": unit.chunk.chunk_id,
+            "filename": unit.chunk.filename,
+            "score": round(unit.score, 4),
+            "level": unit.chunk.level,
+            "text": unit.context_text[:400],
+        }
+        for unit in (units or [])[:8]
+    ]
+
+
+def _grounding_payload(report: Any) -> dict[str, Any]:
+    return {
+        "verdict": report.verdict.value,
+        "support_rate": round(report.support_rate, 4),
+        "coverage": round(report.coverage, 4),
+        "reason": report.reason,
+    }
 
 
 class ConsoleHandler(BaseHTTPRequestHandler):
@@ -297,6 +317,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/ask":
             self._json(self.app.ask(str(payload.get("question", "")), str(payload.get("mode", "pipeline"))))
+        elif path == "/api/stream":
+            self._stream(str(payload.get("question", "")), str(payload.get("mode", "pipeline")))
         elif path == "/api/action":
             self._json(self.app.start_action(str(payload.get("question", ""))))
         elif path == "/api/approve":
@@ -316,6 +338,60 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         # 控制台默认静音：本地调试不该被请求日志刷屏。
         return
+
+
+    def _stream(self, question: str, mode: str) -> None:
+        """流式问答（SSE）。
+
+        事件真实的来自流水线的阶段钩子——retrieve / grade / rewrite / sanitize /
+        generate / grounding / done——不是前端伪造的进度条。每个事件末尾的
+        ``result`` 携带完整答案，与 ``/api/ask`` 的返回结构一致。
+        """
+
+        chunk = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream; charset=utf-8\r\n"
+            "Cache-Control: no-cache\r\n"
+            "X-Accel-Buffering: no\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        try:
+            self.wfile.write(chunk.encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        def send(event: str, payload: dict[str, Any]) -> bool:
+            try:
+                self.wfile.write(
+                    f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                )
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+
+        if not send("stage", {"stage": "queued", "mode": mode}):
+            return
+
+        stages: list[dict[str, Any]] = []
+
+        def on_stage(stage: str, payload: dict[str, Any]) -> None:
+            stages.append({"stage": stage, **payload})
+            send("stage", {"stage": stage, **payload})
+
+        try:
+            if mode == "multiagent":
+                result = self.app.orchestrator.answer(question, on_stage=on_stage)
+                payload = self.app._multiagent_payload(result)  # noqa: SLF001 - 同一个模块内部
+            else:
+                result = self.app.pipeline.answer(question, on_stage=on_stage)
+                payload = self.app._pipeline_payload(result)  # noqa: SLF001
+            send("result", payload)
+        except Exception as exc:  # noqa: BLE001 - 流式中断不能把异常留给某个写死的连接
+            send("error", {"error": type(exc).__name__, "detail": str(exc)[:300]})
 
 
 def _ablation_summary() -> dict[str, Any]:

@@ -100,8 +100,19 @@ class MultiAgentOrchestrator:
 
     # —— 主流程 ——
 
-    def answer(self, question: str) -> MultiAgentResult:
-        """对一个问题做多智能体问答。"""
+    def answer(self, question: str, on_stage: Any = None) -> MultiAgentResult:
+        """对一个问题做多智能体问答。
+
+        ``on_stage`` 为可选阶段回调 ``(stage, payload)``，边界与流水线一致：
+        plan / fanout / synthesize / grounding / done。
+        """
+
+        def emit(stage: str, payload: dict[str, Any]) -> None:
+            if on_stage is not None:
+                try:
+                    on_stage(stage, payload)
+                except Exception:  # noqa: BLE001 - 观察者故障绝不打断主流程
+                    pass
 
         started = time.perf_counter()
         trace = Trace(question=question)
@@ -111,6 +122,7 @@ class MultiAgentOrchestrator:
             plan = self._plan(question)
             step.outputs = {"subquestion_count": len(plan), "plan": plan}
         result.plan = plan
+        emit("plan", {"subquestions": len(plan)})
 
         if len(plan) <= 1:
             # 拆不开就不该扇出：直接走单路，不浪费成本。
@@ -123,6 +135,7 @@ class MultiAgentOrchestrator:
             result.units = list(single.units)
             result.meta["mode"] = "single_fallback"
             result.meta["reason"] = "问题无法拆分，回退到单路流水线"
+            emit("done", {"outcome": result.outcome, "mode": "single_fallback"})
             return result
 
         with trace.step("fanout", StepKind.RETRIEVE, count=len(plan)) as step:
@@ -132,6 +145,14 @@ class MultiAgentOrchestrator:
                 "failed": sum(1 for item in subresults if not item.ok),
             }
         result.subresults = subresults
+        emit(
+            "fanout",
+            {
+                "total": len(subresults),
+                "completed": sum(1 for item in subresults if item.ok),
+                "failed": sum(1 for item in subresults if not item.ok),
+            },
+        )
 
         merged_units = self._merge_evidence(subresults)
         if not merged_units:
@@ -145,6 +166,7 @@ class MultiAgentOrchestrator:
         with trace.step("synthesize", StepKind.GENERATE, units=len(merged_units)) as step:
             answer = self._generate(question, merged_units, trace)
             step.outputs = {"answer_chars": len(answer)}
+        emit("synthesize", {"chars": len(answer), "units": len(merged_units)})
 
         grounding = verify_answer(
             question,
@@ -158,6 +180,10 @@ class MultiAgentOrchestrator:
         result.answer = answer
         result.outcome = grounding.verdict.value if grounding is not None else "pass"
         result.coverage_gaps = [item.subquestion for item in subresults if not item.ok]
+        emit(
+            "grounding",
+            {"verdict": grounding.verdict.value, "support_rate": round(grounding.support_rate, 3)},
+        )
         result.meta["mode"] = "multiagent"
         result.meta.update(
             {
@@ -181,6 +207,7 @@ class MultiAgentOrchestrator:
                 for item in subresults
                 if not item.ok
             ]
+        emit("done", {"outcome": result.outcome, "mode": "multiagent"})
         return result
 
     # —— 规划 ——

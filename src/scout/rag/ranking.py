@@ -24,6 +24,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
+from ..errors import ErrorCode, ProviderError
 from ..llm.scripted import content_tokens, tokenize
 
 
@@ -121,8 +122,126 @@ class RerankOutcome:
         }
 
 
+class CrossEncoderReranker:
+    """真正的 cross-encoder 重排器（BAAI/bge-reranker-base，经由 fastembed ONNX）。
+
+    与 :class:`LexicalReranker` 接口完全一致：输入 query + ``(id, text)`` 候选、
+    输出 ``RerankOutcome``。上层 ``RAGPipeline._postprocess`` 不需要改任何代码。
+
+    **为什么粗排之后必须接这一层**（散落在题库/面试里被反复问到的点）：
+    向量检索是 ANN，Query 与 Doc 分开编码、快但缺少词级交互——
+    语义相近但答非所问的"难负样本"会排上来；
+    cross-encoder 把 ``[query, doc]`` 拼接过一遍完整注意力，
+    因为它慢（每对都要过模型），所以只能吃粗排的 top-k——
+    这正是"粗排管快、重排管准"的分工来源。
+
+    模型侧刻意与向量模型配套：语料是中文，所以选 ``bge-reranker-base``
+    （中英都可用、1GB 级、CPU 可跑）；英文/多语言语料可换
+    ``jinaai/jina-reranker-v2-base-multilingual``。
+
+    与向量器一样**惰性加载**：import scout 不触发下载；装不上就走
+    :func:`default_reranker` 的 ``auto`` 降级（并在 trace 里可见）。
+    """
+
+    DEFAULT_MODEL = "BAAI/bge-reranker-base"
+
+    def __init__(
+        self,
+        *,
+        candidate_limit: int = 50,
+        min_score: float = 0.0,
+        model_name: str = DEFAULT_MODEL,
+        batch_size: int = 8,
+    ) -> None:
+        self.candidate_limit = max(candidate_limit, 1)
+        self.min_score = min_score
+        self.model_name = model_name
+        self.batch_size = max(batch_size, 1)
+        self._model = None
+
+    @property
+    def name(self) -> str:
+        return self.model_name
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder  # noqa: PLC0415
+        except ImportError as exc:  # pragma: no cover - 取决于可选依赖
+            raise ProviderError(
+                "未安装 fastembed，无法使用 cross-encoder 重排。安装：pip install fastembed",
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                retryable=False,
+                provider=self.model_name,
+                operation="rerank",
+            ) from exc
+        try:
+            self._model = TextCrossEncoder(model_name=self.model_name)
+        except Exception as exc:  # noqa: BLE001 - 下载/加载失败都归为 provider 不可用
+            raise ProviderError(
+                f"加载重排模型失败（{self.model_name}）：{exc}",
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                retryable=True,
+                provider=self.model_name,
+                operation="rerank",
+            ) from exc
+        return self._model
+
+    def rerank(
+        self,
+        query: str,
+        candidates: Sequence[tuple[str, str]],
+        *,
+        enabled: bool = True,
+    ) -> RerankOutcome:
+        """与 :meth:`LexicalReranker.rerank` 相同的契约：有界重排、阈值过滤、尾部队保持原序。"""
+
+        if not enabled:
+            return RerankOutcome(
+                ordered=[(identifier, 0.0) for identifier, _ in candidates],
+                applied=False,
+                skipped_reason="disabled",
+            )
+        if not candidates:
+            return RerankOutcome(ordered=[], applied=False, skipped_reason="no_candidates")
+
+        head = list(candidates[: self.candidate_limit])
+        tail = list(candidates[self.candidate_limit :])
+
+        # cross-encoder 每对都要过一次模型，batch 化控制吞吐与内存。
+        model = self._ensure_model()
+        scores: list[float] = []
+        for start in range(0, len(head), self.batch_size):
+            batch = head[start : start + self.batch_size]
+            batch_scores = list(model.rerank(query, [text for _id, text in batch]))
+            scores.extend(float(score) for score in batch_scores)
+
+        scored = sorted(
+            ((identifier, score) for (identifier, _text), score in zip(head, scores)),
+            key=lambda item: (-item[1], item[0]),
+        )
+
+        if self.min_score > 0.0:
+            # 重排器的 raw 分数量纲与词法分数不同（logits，不是 0~1），
+            # 但"过滤掉分数为负或接近零的"这个语义仍然成立。
+            kept = [(identifier, score) for identifier, score in scored if score >= self.min_score]
+            dropped_count = len(scored) - len(kept)
+        else:
+            kept = scored
+            dropped_count = 0
+
+        ordered = kept + [(identifier, 0.0) for identifier, _ in tail]
+        return RerankOutcome(
+            ordered=ordered,
+            applied=True,
+            threshold_applied=self.min_score > 0.0,
+            dropped_count=dropped_count,
+        )
+
+
 class LexicalReranker:
-    """词法重排器（跨编码器的可替换占位实现）。"""
+    """词法重排器（跨编码器的离线基线占位实现）。"""
 
     def __init__(self, *, candidate_limit: int = 50, min_score: float = 0.0) -> None:
         self.candidate_limit = max(candidate_limit, 1)
@@ -177,6 +296,38 @@ class LexicalReranker:
         )
 
 
+def default_reranker(
+    backend: str = "auto",
+    *,
+    candidate_limit: int = 50,
+    min_score: float = 0.0,
+    model_name: str = "",
+):
+    """按后端选择重排器。
+
+    - ``auto``：装了 fastembed 就用 cross-encoder，否则退回词法重排
+    - ``cross``：强制 cross-encoder（装不上就报错，不静默降级）
+    - ``lexical``：强制词法重排（离线基线与单元测试）
+
+    与向量器的选择逻辑一致：**显式要求真实模型的路径不做静默降级**——
+    降级会让"我用了神经重排"这个结论无法解释。
+    """
+
+    if backend == "lexical":
+        return LexicalReranker(candidate_limit=candidate_limit, min_score=min_score)
+    if backend in {"auto", "cross"}:
+        try:
+            kwargs: dict[str, object] = {"candidate_limit": candidate_limit, "min_score": min_score}
+            if model_name:
+                kwargs["model_name"] = model_name
+            return CrossEncoderReranker(**kwargs)
+        except Exception:
+            if backend == "cross":
+                raise
+            return LexicalReranker(candidate_limit=candidate_limit, min_score=min_score)
+    return LexicalReranker(candidate_limit=candidate_limit, min_score=min_score)
+
+
 def normalize_scores(items: Iterable[tuple[str, float]]) -> list[tuple[str, float]]:
     """把分数线性归一到 0~1，便于跨通道比较（谨慎使用，会改变排序语义）。"""
 
@@ -192,8 +343,10 @@ def normalize_scores(items: Iterable[tuple[str, float]]) -> list[tuple[str, floa
 
 
 __all__ = [
+    "CrossEncoderReranker",
     "LexicalReranker",
     "RerankOutcome",
+    "default_reranker",
     "lexical_score",
     "normalize_scores",
     "reciprocal_rank_fusion",

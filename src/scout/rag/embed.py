@@ -357,13 +357,16 @@ def embedder_status(settings: object | None = None) -> dict[str, object]:
     embedding = getattr(effective, "embedding", None)
     backend = getattr(embedding, "backend", "auto")
     model = getattr(embedding, "model", "") or LocalEmbedder.DEFAULT_MODEL
+    local_available = False
     try:
-        import fastembed  # noqa: F401
+        # 用 find_spec 而不是 import：只确认"装没装"，不把 onnxruntime 等
+        # 原生库加载进进程。否则一个状态检查就能把进程拖进
+        # 原生库卸载崩溃（Windows 退出时 0xC0000409）这种本不属于它的问题里。
+        import importlib.util
 
-        local_available = True
-        local_detail = "fastembed 已安装"
-    except ImportError:
-        local_available = False
+        local_available = importlib.util.find_spec("fastembed") is not None
+        local_detail = "fastembed 已安装" if local_available else "未安装 fastembed（pip install fastembed 即可启用本地语义向量）"
+    except Exception:  # noqa: BLE001
         local_detail = "未安装 fastembed（pip install fastembed 即可启用本地语义向量）"
 
     resolved = backend

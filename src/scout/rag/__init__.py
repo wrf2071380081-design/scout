@@ -18,7 +18,14 @@ from .pipeline import (
     RAGPipeline,
     build_index,
 )
-from .ranking import LexicalReranker, RerankOutcome, lexical_score, reciprocal_rank_fusion
+from .ranking import (
+    CrossEncoderReranker,
+    LexicalReranker,
+    RerankOutcome,
+    default_reranker,
+    lexical_score,
+    reciprocal_rank_fusion,
+)
 from .rewrite import (
     DefectReport,
     QueryDefect,
@@ -43,6 +50,7 @@ __all__ = [
     "HybridIndex",
     "INSUFFICIENT",
     "LexicalReranker",
+    "CrossEncoderReranker",
     "MergeMode",
     "MergeOutcome",
     "NO_KNOWLEDGE",
@@ -62,6 +70,7 @@ __all__ = [
     "auto_merge",
     "build_index",
     "cosine",
+    "default_reranker",
     "l2_normalize",
     "lexical_score",
     "reciprocal_rank_fusion",
