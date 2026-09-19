@@ -26,10 +26,12 @@
   n=50）；pairwise bootstrap vs 离线哈希版 27.3%，cross-encoder 神经重排是主要改善来源；
   **作答率 24%**——系统对证据不足的多跳问题**明确拒答而非编造**（门控在工作，不是缺陷）。
 
-- **实现 cross-encoder 神经重排**（fastembed + ONNX，BAAI/bge-reranker-base，中文配套）：
-  与词法重排在同一批候选上**正面交锋**——top-k 排名更替近一半、
-  相关/不相关的分距明显拉开，题型一致的候选不再被稀释。
-  粗排管快（ANN+RRF）、重排管准（cross-encoder）这条经典分工，**这次是落地的，不是引用的**。
+- **实现 cross-encoder 神经重排并买到了真实回报**（fastembed + ONNX，BAAI/bge-reranker-base，中文配套）：
+  同一份 MuSiQue 样本上把词法重排换成 cross-encoder，**端到端作答率从 7% 提到 24%、
+  Recall@5 从 26.7% 提到 48.0%** ——重排这一项就抬了近乎三倍的门槛；
+  单候选对照 top-k 排名更替近一半、相关/不相关的分距明显拉开、CPU 延迟实测 ~5s/20 候选。
+  粗排管快（ANN+RRF）、重排管准（cross-encoder）这条经典分工，**是在同一个语料、同一批样本上
+  实打实测出来的，不是引用的**。
 
 - **真模型替换是可以被验证的**：本地语义向量（fastembed/BGE-zh，512 维）与真实 LLM
   替换离线替身，benchmark 数字从"流程能跑"变成"真的能答"；
