@@ -27,8 +27,8 @@
 
 - **模块级消融与优先级排序**：全模块可独立开关，同语料消融得出边际贡献——
   **混合检索 −41.9pp MRR > 重排 −16.2pp > 查询改写 −1.1pp**；
-  父块合并 REPLACE 策略 **+6.8pp MRR**；公开基准替换重排器
-  （词法 → cross-encoder）**Recall@5 26.7% → 48.0%**。
+  父块合并 REPLACE 策略 **+6.8pp MRR**；公开基准 300 条配对消融替换重排器
+  （词法 → cross-encoder）**Recall@5 +11.67pp（95% CI [8.83, 14.67]，不跨零）**。
 
 - **拒答可校准**：幻觉率与误拒率分列计量；阈值按语料校准——
   中文长文档**误拒率 0%、作答率 68.4%**，英文多跳**作答率 24%**，均**零编造**。
@@ -39,8 +39,9 @@
 
 - **测试结果**：长文档自建语料（40 篇 / 19 条人工标注 / 14 类查询）
   **Recall@1 78.95%、Recall@5 89.47%、拒答正确率 100%、误拒率 0%、作答率 68.42%**；
-  MuSiQue-Ans 公开多跳基准（1000 段联合检索池、50 条冻结样本）
-  **Recall@5 48.0%（bootstrap 95% CI [39.0, 57.0]）、Recall@10 53.0%、零编造**；
+  MuSiQue-Ans 公开多跳基准（5650 段联合检索池、**300 条**冻结样本）
+  **Recall@5 38.5%（95% CI [35.0, 42.2]）、Recall@10 41.0%（95% CI [37.5, 44.8]）**，
+  真实 LLM 端到端（n=50）**作答率 24%、零编造**；
   数据层实测**挡下 13% 重复片段**、双栏**重排 660 行**；
   8 类故障注入实现**故障类型化捕获 100%、预算内恢复 100%、裸异常 0**；
   **175 项测试全绿**（含离线替身模式，无需 API Key）；零依赖 stdio MCP Server + SSE 链路透视控制台。
@@ -53,9 +54,9 @@
 |---|---|---|
 | **Recall@1 78.95% / Recall@5 89.47%** | 长文档自建语料 40 篇、19 条人工标注（14 类查询） | `reports/flywheel_eval.json` |
 | **拒答正确率 100% / 误拒率 0% / 作答率 68.42%** | 同上 | 同上 |
-| **Recall@5 48.0%（CI [39.0, 57.0]）/ Recall@10 53.0%** | MuSiQue-Ans 前 50 条冻结样本、1000 段联合检索池、真实 LLM + 语义向量 + cross-encoder | `evals/results/musique_bench_realllm.md` |
-| **作答率 24%、零编造** | 同上；其余 76% 为门控明确拒答 | 同上 |
-| **7% → 24% / 26.7% → 48.0%** | 同一批样本，唯一变量＝重排器（词法 → cross-encoder） | `evals/results/musique_bench_realllm_2cfg.md` |
+| **Recall@5 38.5%（95% CI [35.0, 42.2]）/ Recall@10 41.0%** | MuSiQue-Ans **前 300 条**冻结样本、5650 段联合检索池、语义向量 + cross-encoder（检索指标，不需 LLM） | `evals/results/musique_rerank_ablation.md` |
+| **作答率 24%、零编造** | **仅 50 条**、真实 LLM 端到端——样本量与上面那行不同，报的时候要带 n | `evals/results/musique_bench_realllm.md` |
+| **配对 Recall@5 +11.67pp [8.83, 14.67]** | 同一批 300 条样本做差（配对 bootstrap），不跨零 | `evals/results/musique_rerank_ablation.md` |
 | **混合检索 −41.9pp MRR / 重排 −16.2pp / 改写 −1.1pp** | 长文档语料消融，19 条样本、**离线替身模型**——只用作"优先级排序"的依据，不要当统计结论报 | `evals/results/ablation.md` |
 | **REPLACE 反胜 EXPAND +6.8pp MRR** | 同上（与主流直觉相反的负向结论） | 同上 |
 | **挡下 115 个重复片段（13%）** | 886 个切分段：精确去重 86 + SimHash 近似去重 29 | `scout ingest` |
@@ -82,7 +83,8 @@ evaluation suite that makes every module measurable, toggleable, and revertible.
 - **Module-level ablation & change-priority**: every module independently toggleable;
   same-corpus ablation yields marginal contributions — **hybrid retrieval −41.9pp MRR >
   reranking −16.2pp > query rewriting −1.1pp**; REPLACE merge **+6.8pp MRR**; on the public
-  benchmark a reranker swap (lexical → cross-encoder) gives **Recall@5 26.7% → 48.0%**.
+  benchmark (n=300, paired) a reranker swap (lexical → cross-encoder) gives
+  **Recall@5 +11.67pp (95% CI [8.83, 14.67], not crossing zero)**.
 - **Calibrated abstention**: hallucination and false-refusal metered separately; thresholds
   calibrated per corpus — Chinese long documents **0% false refusal / 68.4% answer rate**,
   English multi-hop **24% answer rate**, both with **zero fabrication**.
@@ -92,7 +94,9 @@ evaluation suite that makes every module measurable, toggleable, and revertible.
 - **Results**: in-house long-document corpus (40 docs / 19 labelled cases / 14 query types) —
   **Recall@1 78.95%, Recall@5 89.47%, abstention accuracy 100%, false-refusal rate 0%,
   answer rate 68.42%**; public **MuSiQue-Ans** multi-hop benchmark —
-  **Recall@5 48.0% (95% CI [39.0, 57.0]), Recall@10 53.0%, zero fabrication**;
+  **Recall@5 38.5% (95% CI [35.0, 42.2]), Recall@10 41.0% (95% CI [37.5, 44.8])** on
+  **300** frozen samples (5650-paragraph pool); with a real LLM end-to-end (n=50)
+  **24% answer rate, zero fabrication**;
   dedup removed **13% duplicate chunks** and layout restoration reordered **660 lines**;
   8-class fault injection with **100% typed fault capture, 100% in-budget recovery,
   0 uncaught exceptions**; **175 tests green**, reproducible offline with no API key;
@@ -105,14 +109,15 @@ evaluation suite that makes every module measurable, toggleable, and revertible.
 > 「scout 是一个长文档 Agent 系统，检索链路全部换成了真实模型。
 >
 > 我刻意用了**两套语料各测各的能力**：长文档自建语料上 Recall@1 是 78.95%、
-> 拒答正确率 100%、误拒率 0%；公开的多跳基准 MuSiQue 上 Recall@5 是 48%，
-> 而且**零编造**。
+> 拒答正确率 100%、误拒率 0%；公开的多跳基准 MuSiQue 扩到 300 条后
+> Recall@5 是 38.5%，置信区间比之前 50 条时收窄了三倍。
 >
 > 我最想讲的是两个用实验证明过的东西：
 >
 > **第一，检索里最大的杠杆是重排。** 同一批样本我只换了重排器，
-> 端到端作答率从 7% 到 24%，Recall@5 从 26.7% 到 48%。
-> 三个百分点的调参和十七个百分点的结构改动，优先级完全不同。
+> 300 条配对消融下 Recall@5 涨了 11.7 个百分点，置信区间不跨零。
+> 另外我在语料上做了完整的模块消融，能把'该先改什么'排出一个序——
+> 混合检索 41.9pp、重排 16.2pp、查询改写 1.1pp，这三个量级完全不同。
 >
 > **第二，我的拒答率是被数据驱动的，不是全局保守。**
 > 同一套系统在中文长文档上作答率 68.4%，在英文多跳上只有 24%——
@@ -155,7 +160,7 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 > 没有人会跑第二遍。它还有独立的测量价值：离线 F1 是'流程能跑'的天花板
 > （约 0.5%），真实模型是 1.9%，**这个差本身就是分界线的证明**。」
 
-### 5. 「Recall@10 只有 53%，多跳瓶颈在哪」（这一条外部答案要换）
+### 5. 「Recall@10 只有 41%，多跳瓶颈在哪」（这一条外部答案要换）
 
 外部建议答"Query 重写漂移导致 Step 2 偏离主题"——**这是猜的，经不起追问**。
 实测根因是**语料与向量模型的语言错配**：
@@ -168,7 +173,8 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 
 ### 6. 「作答率 24%，多少是误拒」（外部算法要修正）
 
-外部的 `24% / 53% ≈ 45%` 推理偏松——Recall@10 是**逐题证据覆盖度**，
+外部的 `24% / 53% ≈ 45%` 推理偏松（且 53% 已是旧数，扩到 300 条后是 41%）——
+Recall@10 是**逐题证据覆盖度**，
 不是"可检索"的二分标志，不能直接做分母。准确答法：
 
 > 「同一套门控在中文长文档语料上的**误拒率是 0%、作答率 68.42%**，
@@ -189,28 +195,30 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 
 ---
 
-### 9. 「MuSiQue 为什么只测 50 条？CI 跨度 18pp 是不是样本太少」
+### 9. 「MuSiQue 只测了 50 条？CI 跨度 18pp 是不是样本太少」
 
 > ⚠️ **外部建议答"50 条是经过 Stratified Sampling 抽样的冻结测试集"——这是编的。**
-> 实际实现是按顺序取**前 50 条含支撑段落的样本**（`if len(samples) >= SAMPLE_LIMIT: break`），
-> **没有做分层抽样**。面试官追问一句"怎么分层的？各层多少条？"就穿了。
+> 实际实现是按顺序取**前 N 条含支撑段落的样本**，**没有做分层抽样**。
 
-**真实答法**：
+**但这条现在有了更好的答案：检索指标已经扩到 300 条了。**
 
-> 「50 条是**冻结 dev 集的前 50 条**（按顺序取，不做筛选），不是分层抽样——
-> 分层抽样会让样本量看起来更合理，但那个说法我站不住，所以我不用。
+> 「**检索指标（Recall@k）我扩到了 300 条**，含 5650 段的联合检索池——
+> 配对消融下 Recall@5 38.5%（95% CI [35.0, 42.2]），
+> 置信区间从 50 条时的 ±9pp 收窄到 **±3.6pp**。
 >
-> 只跑 50 条纯粹是成本：端到端每条要走真实 LLM + cross-encoder 逐级重排，
-> 单条约 25–60 秒，全量 300 条要一小时以上，而且我的机器没有 GPU。
+> 唯一还停在 50 条的是**需要真实 LLM 的端到端作答率**（24%、零编造）：
+> 每条要走 LLM + 逐级重排，单条 25–60 秒，300 条要 4 小时以上，无 GPU 环境。
+> 这一步我计划放后台跑，**在跑完之前那个 24% 我会明确标注 n=50。**
 >
-> **Bootstrap 95% CI 的作用恰恰是把这个局限量化出来**，而不是掩盖它：
-> [39.0, 57.0] 这 18 个百分点的跨度就是"50 条样本能支撑的结论强度"。
-> 想把它收紧到 ±5pp，样本量大约要到 300 条，这是下一步要做的。」
+> 顺带说一个我自己踩的坑：**扩到 300 条之后，之前基于前 50 条报的绝对值偏高了**
+> （50 条时 Recall@5 是 48%，300 条是 38.5%）。原因不是造假，是抽样——
+> MuSiQue dev 按顺序取，前 50 条比全集容易。所以我现在把'前缀难度曲线'也写进报告，
+> **绝对指标必须用它自己的样本量对应的那一行。**」
 
-**为什么这个答法比"分层抽样"强**：它同时展示了三件事——知道自己的评测成本、
-知道 CI 的统计含义、知道下一步要多少样本。而编一个抽样方法，只需要一个问题就崩。
+**为什么这个答法最强**：它同时回答了"样本量小"和"数字是不是挑出来的"
+两个隐含质疑，而且用的是自己发现的偏差，不是等对方指出来。
 
-### 10. 「top_k × 4 的截断阈值怎么定的？会不会就是它导致 Recall@10 只有 53%」
+### 10. 「top_k × 4 的截断阈值怎么定的？会不会就是它导致 Recall@10 只有 41%」
 
 > ⚠️ **外部建议答"经过延迟敏感度压测得出的折中点……扩到 top_k × 10 延迟升 2.5x
 > 但 Recall@10 仅提升 3.2%"——这两个数字都是编的，我们从没跑过那个实验。**
@@ -227,7 +235,7 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 > 候选数直接决定延迟，所以设了上限防止候选池被撑大；因为单路只取 16 条，
 > 这个上限目前是安全余量而不是紧约束。」
 
-**53% 的真实原因**（与第 5 条同源，两个原因叠加）：
+**41% 的真实原因**（与第 5 条同源，两个原因叠加）：
 
 1. **单路检索取 16 条，而多跳题需要跨 2+ 篇文档的证据** —— 一个 query 很难同时取全；
    解法是子问题分解 + 多路召回合并，而不是把 k 调大。
@@ -290,7 +298,22 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 因为它们的运行记录不在本仓库。如果你确认来自另一个项目且能讲清口径，告诉我加回来；
 记不清怎么算的就别放——这类数字是面试官最爱追问的类型。
 
-**三个"想更激进就先钉口径"的方向**：
-1. MuSiQue 从 50 条扩到 300 条（从"方向性"变"结论性"）；
-2. 重排消融从 30 条扩到 200 条（当前是 30 条，CI 较宽）；
-3. 长文档标注从 19 条补到 50 条（让"拒答正确率 100%"站在更大的分母上）。
+**三个"想更激进就先钉口径"的方向（进度）**：
+1. ✅ **已完成**：MuSiQue 检索指标扩到 300 条（5650 段池），CI 从 ±9pp 收窄到 ±3.6pp；
+2. ✅ **已完成**：重排消融扩到 300 条**配对**比较（+11.67pp [8.83, 14.67]，不跨零），
+   且不再消耗 LLM 调用（Recall@k 与生成模型无关）；
+3. ⬜ **待办（最该做的）**：把"拒答正确率 100%"的**分母从 2 补到 12** ——
+   这是简历上最脆弱的数字（面试官问"100% 是几条？"答案是"2 条"）。
+   另：MuSiQue 的**端到端作答率**若要同步扩到 300 条，需 4 小时后台跑真实 LLM。
+
+### 12. 「你怎么保证这些数字不是挑出来的？」
+
+> 「两个机制。**一是所有绝对指标都带样本量**：n=300 和 n=50 我会分开写，
+> 不会拿小样本的数字代表全集。
+>
+> **二是我主动报了一个对我自己不利的发现**：把 MuSiQue 从 50 条扩到 300 条之后，
+> Recall@5 从 48% 降到 38.5%——因为我发现前 50 条比全集容易。
+> 这个数字我本来可以不测、不报，简历上就写着 48%。
+>
+> 我还把'前缀难度曲线'（50/100/200/300 各是多少）写进了报告，
+> 让它成为一个可以随时被检查的东西，而不是一个孤零零的数字。」
