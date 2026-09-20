@@ -44,6 +44,19 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _env_list(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """逗号分隔的字符串列表。
+
+    空字符串视为"未设置"而不是"空列表"——否则清空一个环境变量
+    会静默把配置变成空值，这种"看起来生效了其实没有"的行为最难排查。
+    """
+
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddingSettings:
     """向量器配置。
@@ -173,6 +186,56 @@ class VerifySettings:
 
 
 @dataclass(frozen=True, slots=True)
+class IntentSettings:
+    """意图漏斗配置。
+
+    默认**关闭**：漏斗需要业务意图词典与原型句，填错了反而会误伤正常问题。
+    要开就一次性把三类配置写全（:attr:`rules` / :attr:`prototypes` / :attr:`sensitive`），
+    而不是打开一个只有框架没有内容的空漏斗。
+    """
+
+    enabled: bool = False
+    semantic_threshold: float = 0.62
+    margin_threshold: float = 0.15
+    sensitive_labels: tuple[str, ...] = ()
+    # 命中这些标签就直接短路：不做检索也不调生成（省钱且更快）
+    short_circuit_labels: tuple[str, ...] = ("闲聊", "越界")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSettings:
+    """运行时链配置：缓存 / 路由 / 预算。
+
+    三者都是策略层，可以独立开关——对照实验需要"只开缓存不开路由"这类组合，
+    所以不做成一个总开关。
+    """
+
+    cache_enabled: bool = False
+    cache_threshold: float = 0.93
+    cache_max_items: int = 512
+    cache_scope_version: str = "v1"
+
+    routing_enabled: bool = False
+    fast_model: str = ""
+
+    budget_tokens: int = 0
+
+    # —— 装配顺序（不可随意调整，见 runtime/factory.py 的说明）——
+    # 缓存最外层（命中不花钱，必须最先短路）→ 预算中间（按模型价判额度）
+    # → 路由最内层（决定用哪个模型）
+    @property
+    def stack_order(self) -> tuple[str, ...]:
+        layers = ["base"]
+        if self.routing_enabled:
+            layers.append("router")
+        if self.budget_tokens > 0:
+            layers.append("budget")
+        if self.cache_enabled:
+            layers.append("cache")
+        return tuple(layers)
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """聚合配置。"""
 
@@ -183,6 +246,8 @@ class Settings:
     agent: AgentSettings = field(default_factory=AgentSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
     verify: VerifySettings = field(default_factory=VerifySettings)
+    runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+    intent: IntentSettings = field(default_factory=IntentSettings)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -248,6 +313,22 @@ class Settings:
                 ),
                 sanitize_enabled=_env_bool("SCOUT_SANITIZE_ENABLED", True),
                 require_citations=_env_bool("SCOUT_REQUIRE_CITATIONS", True),
+            ),
+            runtime=RuntimeSettings(
+                cache_enabled=_env_bool("SCOUT_CACHE_ENABLED", False),
+                cache_threshold=_env_float("SCOUT_CACHE_THRESHOLD", 0.93),
+                cache_max_items=_env_int("SCOUT_CACHE_MAX_ITEMS", 512),
+                cache_scope_version=_env_str("SCOUT_CACHE_SCOPE_VERSION", "v1"),
+                routing_enabled=_env_bool("SCOUT_ROUTING_ENABLED", False),
+                fast_model=_env_str("SCOUT_LLM_FAST_MODEL", ""),
+                budget_tokens=_env_int("SCOUT_BUDGET_TOKENS", 0, minimum=0),
+            ),
+            intent=IntentSettings(
+                enabled=_env_bool("SCOUT_INTENT_ENABLED", False),
+                semantic_threshold=_env_float("SCOUT_INTENT_SEMANTIC_THRESHOLD", 0.62),
+                margin_threshold=_env_float("SCOUT_INTENT_MARGIN_THRESHOLD", 0.15),
+                sensitive_labels=_env_list("SCOUT_INTENT_SENSITIVE"),
+                short_circuit_labels=_env_list("SCOUT_INTENT_SHORT_CIRCUIT", ("闲聊", "越界")),
             ),
         )
 

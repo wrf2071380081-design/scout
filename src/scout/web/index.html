@@ -243,6 +243,15 @@ let currentRun = null;
    `Unexpected end of JSON input` 这种看不懂的错。 */
 const API_CANDIDATES = ["", "http://127.0.0.1:8765", "http://localhost:8765"];
 let apiBase = null;
+// 动作关键词由后端下发（/api/health）。前端的"这条请求要不要走审批通道"
+// 必须和后端的意图漏斗用同一份词表——两份词表迟早漂移，
+// 而漂移的后果是"该审批的请求被当普通问答直接执行了"。
+// 这里的兜底列表只在拿不到后端配置时使用。
+let actionKeywords = ["邮件", "工单", "发通知", "发送", "删除", "转人工", "退款", "下单", "付款"];
+
+function looksLikeAction(text) {
+  return actionKeywords.some((word) => word && text.includes(word));
+}
 
 async function readJson(res) {
   const text = await res.text();
@@ -259,6 +268,9 @@ async function probeBackend() {
       const payload = await readJson(res);
       if (payload && typeof payload.documents === "number") {
         apiBase = base;
+        if (Array.isArray(payload.action_keywords) && payload.action_keywords.length) {
+          actionKeywords = payload.action_keywords;
+        }
         return payload;
       }
     } catch (e) { /* 试下一个 */ }
@@ -312,7 +324,7 @@ $("ask").onclick = async () => {
   $("ask").disabled = true; $("ask").textContent = "运行中…";
   try {
     // 带副作用的请求走动作通道（会触发 HITL 审批）
-    if (/发邮件|建工单|删除|发送/.test(q)) {
+    if (looksLikeAction(q)) {
       const r = await api("/api/action", { question: q });
       currentRun = r.run_id;
       $("answer").textContent = r.status === "awaiting_approval"

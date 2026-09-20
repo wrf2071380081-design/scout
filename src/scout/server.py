@@ -34,6 +34,7 @@ from .llm.base import LLMResponse, ToolCall
 from .llm.scripted import default_client
 from .multiagent import MultiAgentOrchestrator
 from .rag.pipeline import RAGPipeline, build_index
+from .runtime.intent import ACTION_KEYWORDS
 from .hitl import (
     HumanDecision,
     InMemoryCheckpointStore,
@@ -218,6 +219,11 @@ class ConsoleApp:
             "embedder": self.index.embedder.name,
             "semantic_retrieval": bool(semantic),
             "offline": not self.settings.llm.configured,
+            # 把动作关键词下发给前端：前端要判断"这条请求该走审批通道"，
+            # 而它没法 import Python 常量。**下发而不是让前端各写一份**——
+            # 两份词表迟早会漂移，而漂移的后果是"该审批的请求被当普通问答执行了"。
+            "action_keywords": list(ACTION_KEYWORDS),
+            "intent_enabled": bool(self.settings.intent.enabled),
         }
 
 

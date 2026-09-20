@@ -118,48 +118,62 @@ class IntentFunnel:
     # —— 第一层：规则 ——
 
     def _match_rules(self, query: str) -> IntentResult | None:
-        """关键词/正则命中。全命中给高置信，部分命中给按比例的中间置信度。"""
+        """关键词/正则命中。
 
-        scores: list[tuple[str, float]] = []
+        **判据：命中强度，而不是"命中比例"。**
+        早期实现用 ``命中数 / 词表长度`` 打分，结果是 5 个关键词命中 1 个只有 0.2 分，
+        被门槛直接拦掉——可"用户说了天气"这件事本身就足够判定闲聊，
+        词表里还有几个别的词跟这次判定毫无关系。
+        **把词表长度放进分母是个错误抽象**：词表是"可能出现的说法清单"，
+        不是"必须全部命中的条件"。
+
+        现在改为：任一关键词命中即成立，置信度由**最长命中词的长度**决定——
+        词越长越具体、越不容易误命中（"退款"比"退"可靠得多），
+        这是一个不需要训练就能成立的可解释信号。
+        """
+
         lowered = query.lower()
+        scores: list[tuple[str, float, int]] = []  # (标签, 置信度, 最长命中词长)
         for label, patterns in self.rules.items():
-            if not patterns:
+            hits = [pattern for pattern in patterns if pattern.lower() in lowered]
+            if not hits:
                 continue
-            hits = sum(1 for pattern in patterns if pattern.lower() in lowered)
-            if hits:
-                scores.append((label, hits / len(patterns)))
+            longest = max(len(pattern) for pattern in hits)
+            # 2 字词给 0.75、每多 1 字 +0.05，封顶 rule_hit_confidence
+            confidence = min(self.rule_hit_confidence, 0.70 + 0.05 * longest)
+            scores.append((label, confidence, longest))
         if not scores:
             return None
-        scores.sort(key=lambda item: (-item[1], item[0]))
-        best_label, best_score = scores[0]
+
+        # 多个标签同时命中时：先看置信度，再看最长命中词长度，最后按标签名保证确定性
+        scores.sort(key=lambda item: (-item[1], -item[2], item[0]))
+        best_label, best_score, _best_len = scores[0]
         margin = best_score - (scores[1][1] if len(scores) > 1 else 0.0)
-        if best_score >= 0.999 or (best_score >= 0.5 and margin > 0):
-            # 第一层的承诺是"零延迟且确定"：条件不满足就不下结论，交下一层，
-            # 而不是在这里给一个勉强的答案。
-            confidence = self.rule_hit_confidence if best_score >= 0.999 else 0.7 + 0.2 * margin
-            tier = IntentTier.RULE
-            label = best_label
-            if label in self.sensitive_labels and confidence >= self.rule_hit_confidence:
-                # 高敏感意图：规则命中也不自动执行，降级为"求确认"
-                self.stats[IntentTier.CLARIFY.value] += 1
-                return IntentResult(
-                    label=label,
-                    confidence=confidence,
-                    tier=IntentTier.CLARIFY,
-                    margin=margin,
-                    candidates=scores,
-                    reason="高敏感意图命中规则，需显式确认后才执行",
-                )
-            self.stats[tier.value] += 1
+
+        # 歧义（两个标签都命中且置信度接近）不进规则层下结论，交给下面的层
+        if len(scores) > 1 and margin <= 0.0:
+            return None
+
+        if best_label in self.sensitive_labels:
+            # 高敏感意图：规则命中也不自动执行，降级为"求确认"
+            self.stats[IntentTier.CLARIFY.value] += 1
             return IntentResult(
-                label=label,
-                confidence=confidence,
-                tier=tier,
+                label=best_label,
+                confidence=best_score,
+                tier=IntentTier.CLARIFY,
                 margin=margin,
-                candidates=scores,
-                reason="规则命中",
+                candidates=[(label, score) for label, score, _length in scores],
+                reason="高敏感意图命中规则，需显式确认后才执行",
             )
-        return None
+        self.stats[IntentTier.RULE.value] += 1
+        return IntentResult(
+            label=best_label,
+            confidence=best_score,
+            tier=IntentTier.RULE,
+            margin=margin,
+            candidates=[(label, score) for label, score, _length in scores],
+            reason="规则命中",
+        )
 
     # —— 第二层：轻量语义 ——
 
@@ -327,4 +341,89 @@ class IntentFunnel:
         return dict(self.stats)
 
 
-__all__ = ["IntentFunnel", "IntentResult", "IntentTier"]
+KNOWLEDGE_LABEL = "知识问答"
+ACTION_LABEL = "动作请求"
+CHITCHAT_LABEL = "闲聊"
+OUT_OF_SCOPE_LABEL = "越界"
+
+# 动作类意图的触发词：与 Web 控制台里"带副作用的请求走审批通道"的判断保持一致。
+# **两边用同一份词表**（server 直接 import 这个常量）——否则控制台认为该审批、
+# 漏斗认为该走检索，行为会互相矛盾。
+#
+# 这些词是"出现就该当动作处理"的强信号，因此要覆盖口语说法：
+# 用户说"帮我给客户发一封邮件"，关键词是"邮件"而不是"发邮件"——
+# 早期只写了"发邮件"，结果最典型的动作请求反而漏掉了。
+ACTION_KEYWORDS = (
+    "邮件",
+    "工单",
+    "发通知",
+    "发送",
+    "删除",
+    "转人工",
+    "退款",
+    "下单",
+    "付款",
+)
+
+DEFAULT_RULES: dict[str, list[str]] = {
+    ACTION_LABEL: list(ACTION_KEYWORDS),
+    CHITCHAT_LABEL: ("天气", "讲个笑话", "你是谁", "在吗", "谢谢"),
+}
+
+DEFAULT_PROTOTYPES: dict[str, list[str]] = {
+    KNOWLEDGE_LABEL: (
+        "这份文件里是怎么规定的",
+        "标准体系包括哪些部分",
+        "报告里提到的指标是多少",
+        "某条要求的具体内容是什么",
+    ),
+    CHITCHAT_LABEL: ("今天天气怎么样", "你在吗", "讲个笑话吧", "你是谁"),
+    ACTION_LABEL: ("帮我给客户发一封邮件", "把这条工单删除", "发送通知给负责人"),
+    OUT_OF_SCOPE_LABEL: ("帮我写一首诗", "推荐几部电影", "明天股市会涨吗"),
+}
+
+
+def build_knowledge_funnel(
+    *,
+    embedder: Embedder | None = None,
+    llm: LLMClient | None = None,
+    semantic_threshold: float = 0.62,
+    margin_threshold: float = 0.15,
+    sensitive_labels: Sequence[str] = (ACTION_LABEL,),
+    rules: Mapping[str, Sequence[str]] | None = None,
+    prototypes: Mapping[str, Sequence[str]] | None = None,
+) -> IntentFunnel:
+    """开箱可用的知识域漏斗。
+
+    四类意图：知识问答（默认去向）、动作请求（有副作用，必须人审）、
+    闲聊（零成本短路）、越界（不硬答）。
+
+    **动作请求默认放进高敏感集合**：它能触发外部副作用，
+    即便分类置信度再高，也不该由分类器直接决定执行——
+    分类只负责"这可能是个动作"，执行与否由审批链决定。
+    """
+
+    return IntentFunnel(
+        rules=dict(rules) if rules is not None else dict(DEFAULT_RULES),
+        prototypes=dict(prototypes) if prototypes is not None else dict(DEFAULT_PROTOTYPES),
+        embedder=embedder,
+        llm=llm,
+        semantic_threshold=semantic_threshold,
+        margin_threshold=margin_threshold,
+        sensitive_labels=sensitive_labels,
+    )
+
+
+__all__ = [
+    "ACTION_KEYWORDS",
+    "ACTION_LABEL",
+    "CHITCHAT_LABEL",
+    "DEFAULT_PROTOTYPES",
+    "DEFAULT_RULES",
+    "IntentFunnel",
+    "IntentResult",
+    "IntentTier",
+    "KNOWLEDGE_LABEL",
+    "OUT_OF_SCOPE_LABEL",
+    "build_knowledge_funnel",
+]

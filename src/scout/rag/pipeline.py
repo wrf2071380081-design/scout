@@ -147,6 +147,11 @@ def _stream_supports(client: Any) -> bool:
     return supports_streaming(client)
 
 
+# 与 runtime.intent.ACTION_LABEL 保持同值的字面量。这里不直接 import 是为了避免
+# 包级循环导入；测试里有一条断言专门校验两者一致，防止哪天改了一边忘了另一边。
+_ACTION_LABEL = "动作请求"
+
+
 class RAGPipeline:
     """可配置、可观测、可消融的 RAG 流水线。"""
     def __init__(
@@ -156,6 +161,7 @@ class RAGPipeline:
         *,
         settings: Settings | None = None,
         config: PipelineConfig | None = None,
+        funnel: Any = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.config = config or PipelineConfig(
@@ -165,6 +171,20 @@ class RAGPipeline:
         )
         self.index = index
         self.llm: LLMClient = llm or default_client()
+        # 意图漏斗：只在配置显式打开时构建。
+        # 复用索引已有的向量器（第二层语义判定不需要额外模型），
+        # 完全没配就保持 None —— 一个"没有词典的空漏斗"只会浪费一次判定。
+        self.funnel = funnel
+        if self.funnel is None and self.settings.intent.enabled:
+            from ..runtime.intent import build_knowledge_funnel
+
+            self.funnel = build_knowledge_funnel(
+                embedder=getattr(index, "embedder", None),
+                llm=self.llm,
+                semantic_threshold=self.settings.intent.semantic_threshold,
+                margin_threshold=self.settings.intent.margin_threshold,
+                sensitive_labels=self.settings.intent.sensitive_labels,
+            )
         self.reranker = default_reranker(
             self.settings.retrieval.rerank_backend,
             candidate_limit=max(self.settings.retrieval.top_k * 4, 20),
@@ -460,6 +480,31 @@ class RAGPipeline:
         trace = Trace(question=question)
         result = PipelineResult(question=question, answer="", outcome=NO_KNOWLEDGE, trace=trace)
         result.meta["config_label"] = self.config.label()
+
+        # —— 意图前置：决定"要不要检索" ——
+        # 这一步的价值不只是分类准确率，而是**它能在检索之前短路**：
+        # 闲聊与越界问题根本不需要检索与生成，省下的是真金白银与一次往返延迟。
+        if self.funnel is not None:
+            intent = self.funnel.classify(question)
+            result.meta["intent"] = intent.to_dict()
+            emit("intent", {k: v for k, v in intent.to_dict().items() if k != "candidates"})
+            short_circuit = tuple(self.settings.intent.short_circuit_labels)
+            if intent.needs_clarification:
+                options = self.funnel.clarify_options(intent)
+                result.outcome = CLARIFY
+                result.answer = CLARIFY_ANSWER + (f"可选：{'、'.join(options)}" if options else "")
+                result.error_code = InsufficientEvidenceError.default_code.value
+                emit("done", {"outcome": result.outcome, "intent_short_circuit": "clarify"})
+                return result
+            if intent.label in short_circuit:
+                result.outcome = NO_KNOWLEDGE
+                result.answer = f"这个问题不属于本知识库的覆盖范围（识别为「{intent.label}」），未执行检索。"
+                emit("done", {"outcome": result.outcome, "intent_short_circuit": intent.label})
+                return result
+            if intent.label == _ACTION_LABEL:
+                # 动作类请求不在这里执行：标记出来交给带审批的通道。
+                # 检索照常进行（动作往往需要先查清楚对象），但调用方必须看得见这个标记。
+                result.meta["intent_route"] = "action"
 
         units, meta, grade = self.collect(question, trace)
         result.meta.update(meta)

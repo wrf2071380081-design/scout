@@ -47,7 +47,12 @@ class Section:
 
 @dataclass(slots=True)
 class IngestReport:
-    """入库报告。"""
+    """入库报告。
+
+    ``reading_order`` 记录**每一篇**的阅读顺序分，而不是只记被拒的那几篇。
+    原因见 :func:`ingest` 里对这个指标局限性的说明——它是分诊信号，
+    需要人工看分布才能判断，只暴露"被拒名单"会让人误以为其余都很好。
+    """
 
     documents: int = 0
     sections: int = 0
@@ -56,6 +61,7 @@ class IngestReport:
     dropped_near: int = 0
     versions_created: int = 0
     low_quality: list[str] = field(default_factory=list)
+    reading_order: dict[str, float] = field(default_factory=dict)
     layout: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
@@ -67,6 +73,7 @@ class IngestReport:
             "dropped_near": self.dropped_near,
             "versions_created": self.versions_created,
             "low_quality": self.low_quality[:20],
+            "reading_order": {name: round(score, 3) for name, score in self.reading_order.items()},
             "layout": dict(self.layout),
         }
 
@@ -121,14 +128,27 @@ def ingest(
     *,
     registry: VersionRegistry | None = None,
     near_threshold: int = 3,
-    min_reading_order: float = 0.3,
+    min_reading_order: float = 0.0,
     max_chars: int = 1800,
 ) -> tuple[list[Section], IngestReport, VersionRegistry]:
     """完整入库流水线。
 
-    :param min_reading_order: 阅读顺序完好度低于此值的文档会被拒绝入库并记入报告。
-        宁可少收一篇，也不要让错序文本污染整个检索库——
-        **坏数据比没数据更难排查，因为它不报错。**
+    :param min_reading_order: 阅读顺序的**拒收门槛**。默认 ``0.0``＝不拒收，只记录。
+
+    **为什么默认不拒收（一次真实的误杀带来的结论）。**
+    最初把它设成 0.3 当硬门禁，在 40 篇真实语料上跑，5 篇被判 0 分——
+    申报指南、年报摘要、电子证书样式。人工检查后发现它们**没有任何版面错误**，
+    只是表格与列表密集：这个指标测的是"像不像连续散文"，
+    而表格行本来就不以句号结尾。用"散文的规矩"去量"表格"，
+    得到的低分反映的是**体裁**，不是错误。
+
+    教训有两条，都写进默认值里：
+
+    1. **不能拿一个会误杀 12% 真实语料的指标当硬门禁**，
+       因为误杀是静默的——报告里有个数字、文档也确实被拒了，
+       只有人工逐篇看才会发现拒错了。
+    2. **要拒收就必须显式设阈值**（例如 0.05 用于抓真正的乱序文本），
+       让"我决定拦掉一些文档"成为一个有人签字的动作，而不是默认行为。
     """
 
     report = IngestReport(documents=len(documents))
@@ -145,7 +165,8 @@ def ingest(
         layout_totals.page_breaks += layout.page_breaks
 
         quality = reading_order_ratio(restored)
-        if quality < min_reading_order:
+        report.reading_order[doc_id] = quality
+        if min_reading_order > 0.0 and quality < min_reading_order:
             report.low_quality.append(f"{doc_id} (reading_order={quality:.2f})")
             continue
 

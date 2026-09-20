@@ -213,6 +213,24 @@ def cmd_hitl_demo(args: argparse.Namespace) -> int:
 
     registry = ToolRegistry([*build_default_tools(), *build_action_tools()])
 
+    # 状态存储：默认内存（演示够用），给了 --store 就换成外部后端。
+    # 这里刻意"给了 URL 就必须成功"——不做静默降级，
+    # 因为"以为在用 Redis 实际在用内存"会让跨进程恢复这件事悄悄不成立。
+    store = None
+    store_label = "内存"
+    store_url = getattr(args, "store", "") or ""
+    if store_url:
+        from .hitl.checkpoints import RedisCheckpointStore
+
+        try:
+            store = RedisCheckpointStore(store_url)
+            store_label = f"Redis({store_url})"
+        except Exception as exc:  # noqa: BLE001
+            print(f"无法连接状态存储 {store_url}：{type(exc).__name__}: {exc}")
+            print("提示：Redis 需要 pip install redis 且服务可达；也可先用内存实现跑演示。")
+            return 1
+    print(f"状态存储：{store_label}")
+
     send_mail = LLMResponse(
         tool_calls=[ToolCall(name="send_email", arguments={"to": "boss@example.com", "subject": "周报", "body": "…"})]
     )
@@ -227,6 +245,7 @@ def cmd_hitl_demo(args: argparse.Namespace) -> int:
         ),
         registry,
         timeout_policy=TimeoutPolicy.REJECT,
+        store=store,
     )
 
     first = agent.start("把本周周报发给老板")
@@ -285,6 +304,192 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 # —— doctor ——
+
+
+def cmd_intent(args: argparse.Namespace) -> int:
+    """跑一次意图三层漏斗，并说明"停在哪一层、为什么"。
+
+    这个命令的价值不在分类结果本身，而在**可解释性**：
+    同一个问题为什么不走大模型？为什么被要求澄清？
+    这些在生产里都是会被反复追问的问题，答案应该能直接打印出来。
+    """
+
+    settings = get_settings()
+    from .rag.embed import default_embedder
+    from .runtime.intent import build_knowledge_funnel
+
+    client = default_client() if args.llm else None
+    try:
+        embedder = default_embedder(settings.embedding) if args.embed else None
+    except Exception as exc:  # noqa: BLE001 - 没有向量器时退化为"只有规则层"，如实说明
+        print(f"（向量器不可用，第二层语义判定跳过：{type(exc).__name__}）")
+        embedder = None
+
+    funnel = build_knowledge_funnel(
+        embedder=embedder,
+        llm=client,
+        semantic_threshold=settings.intent.semantic_threshold,
+        margin_threshold=settings.intent.margin_threshold,
+    )
+
+    queries = [args.query] if args.query else [
+        "云计算标准体系包括哪几个部分？",
+        "帮我给客户发一封邮件",
+        "今天天气怎么样",
+        "帮我写一首诗",
+        "我那笔订单想退一下",
+    ]
+    print(f"意图漏斗（向量器：{'语义' if embedder else '未启用（仅规则层+LLM）'}）")
+    print("-" * 72)
+    for query in queries:
+        result = funnel.classify(query)
+        print(f"输入：{query}")
+        print(f"  判定：{result.label or '（未判定）'}  置信度 {result.confidence:.3f}  "
+              f"分差 {result.margin:.3f}")
+        print(f"  停在：{result.tier.value} 层    理由：{result.reason}")
+        options = funnel.clarify_options(result)
+        if options:
+            print(f"  澄清候选：{' / '.join(options)}")
+        print()
+    print("各层命中分布：", funnel.distribution())
+    if not settings.intent.enabled:
+        print()
+        print("提示：流水线默认不启用意图前筛。要启用：set SCOUT_INTENT_ENABLED=1")
+    return 0
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """跑一遍入库流水线（版面还原 → 切分 → 去重 → 版本），只打报告不写库。"""
+
+    from .data import ingest
+
+    directory = Path(args.corpus)
+    if not directory.exists():
+        print(f"语料目录不存在：{directory}")
+        return 1
+    documents = load_corpus(directory, max_files=args.limit or None)
+    sections, report, registry = ingest(documents)
+
+    print(f"入库流水线：{directory}")
+    print("-" * 72)
+    print(f"  文档        : {report.documents}")
+    print(f"  切分片段    : {report.sections}")
+    print(f"  保留        : {report.kept}")
+    print(f"  精确重复丢弃: {report.dropped_exact}")
+    print(f"  近似重复丢弃: {report.dropped_near}")
+    print(f"  版本变更    : {report.versions_created}")
+    layout = report.layout
+    print(f"  版面        : 双栏={layout.get('columns_detected')} "
+          f"重排行数={layout.get('lines_reordered')} "
+          f"跨页表格合并={layout.get('tables_merged')} "
+          f"补写表头={layout.get('headers_repeated')}")
+    scores = sorted(report.reading_order.values())
+    if scores:
+        undecided = sum(1 for value in report.reading_order.values() if value >= 1.0)
+        judgeable = [value for value in scores if value < 1.0]
+        summary = f"  阅读顺序    : 可判断 {len(judgeable)} 篇 / 无法判断 {undecided} 篇"
+        if judgeable:
+            summary += f"｜最低 {judgeable[0]:.2f} 中位 {judgeable[len(judgeable) // 2]:.2f}"
+        print(summary)
+        print("              （表格/列表为主的文档散文行不足，判为无法判断而不是不合格；")
+        print("                在 40 篇真实语料上量过，可判断的那些没有一篇低于 0.5）")
+    if report.low_quality:
+        print(f"  质量门禁拒绝: {len(report.low_quality)} 篇 → {report.low_quality[:5]}")
+    else:
+        print("  质量门禁    : 未启用拒收（默认只记录；需要显式设阈值才会拦）")
+    print()
+    print(f"版本登记：{len(list(registry.active()))} 个活跃文档")
+    if args.out:
+        Path(args.out).write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"报告已写入 {args.out}")
+    return 0
+
+
+def cmd_stack(args: argparse.Namespace) -> int:
+    """展示运行时链的装配顺序，并跑一次最小缓存/预算/路由验证。"""
+
+    from .llm.base import ChatMessage, LLMRequest
+    from .rag.embed import default_embedder
+    from .runtime.factory import build_runtime_stack
+
+    settings = get_settings()
+    # 演示时把三层都打开，否则"什么都没有"的栈看不出顺序
+    demo = settings
+    try:
+        from dataclasses import replace
+
+        demo = replace(
+            settings,
+            runtime=replace(
+                settings.runtime,
+                cache_enabled=True,
+                routing_enabled=True,
+                budget_tokens=args.budget,
+            ),
+        )
+        embedder = default_embedder(settings.embedding) if args.embed else None
+    except Exception:  # noqa: BLE001
+        embedder = None
+
+    stack = build_runtime_stack(default_client(), demo, embedder=embedder)
+    print("运行时链装配（由内到外）：", " → ".join(stack.order))
+    print("-" * 72)
+    print("  顺序不是随意的：缓存最外层（命中不花钱，必须最先短路）→")
+    print("  预算中间层（要按真正选中的模型价判额度）→ 路由最内层（决定用哪个模型）。")
+    print()
+
+    request = LLMRequest(
+        messages=[ChatMessage(role="user", content=args.query)],
+        task="grade",
+        context={"evidence_digest": "demo-scope"},
+    )
+    for attempt in (1, 2):
+        response = stack.client.complete(request)
+        print(f"  第 {attempt} 次调用：{len(response.content)} 字符，"
+              f"用量 {response.usage.total} token")
+    report = stack.report()
+    print()
+    print("各层数据：")
+    print(f"  缓存：{report.get('cache')}")
+    print(f"  预算：{report.get('budget')}")
+    print(f"  路由：{report.get('router')}")
+    print()
+    print("注意第 2 次调用的 token 用量为 0 —— 它是缓存命中，本来就不该花钱；")
+    print("而缓存层在预算层之外，所以这次命中不会触发任何预算检查。")
+    return 0
+
+
+def cmd_judge_compare(args: argparse.Namespace) -> int:
+    """LLM 裁判 vs 词法归因校验：同一批答案上两种评分的对照。"""
+
+    from .evolution.compare import compare_judges, demo_cases
+
+    settings = get_settings()
+    client = default_client()
+    cases = demo_cases()
+    if not settings.llm.configured and not args.allow_offline:
+        print("未配置真实 LLM，裁判层的分数没有意义。")
+        print("用 --allow-offline 强行运行（会用离线启发式当裁判，仅供看流程）。")
+        return 1
+
+    result = compare_judges(client, cases)
+    print(f"对照样本：{len(cases)} 条")
+    print("-" * 72)
+    print(f"{'问题':<28}{'归因判定':<12}{'裁判均分':<10}{'一致'}")
+    for row in result["rows"]:
+        agree = "✓" if row["agree"] else "✗"
+        print(f"{row['question'][:26]:<28}{row['verdict']:<12}{row['judge_overall']:<10.2f}{agree}")
+    print()
+    print(f"一致率：{result['agreement']:.0%}（{result['n']} 条）")
+    print("裁判校准：" + json.dumps(result["calibration"], ensure_ascii=False))
+    print()
+    print("为什么要把两者放在一起看：")
+    print("  归因校验是**词法**的（能不能在证据里找到支撑），便宜、确定、可复现；")
+    print("  裁判是**语义**的（答得切不切题、有没有冗余），贵、有偏见、但能覆盖词法盲区。")
+    print("  两者不一致的样本最有价值——它不是'谁对谁错'，而是提示 rubric 或阈值需要校准。")
+    return 0
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
@@ -397,7 +602,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     hitl = sub.add_parser("hitl", help="HITL 中断/审批/恢复/时间旅行演示")
     hitl.add_argument("--mode", choices=("demo",), default="demo", help="演示模式")
+    hitl.add_argument("--store", default="", help="状态存储：留空=内存，redis://host:port/db 用 Redis")
     hitl.set_defaults(func=cmd_hitl_demo)
+
+    intent = sub.add_parser("intent", help="跑一次意图三层漏斗，看它停在哪一层、为什么")
+    intent.add_argument("query", nargs="?", default="", help="要判定的问题；省略则跑内置样例")
+    intent.add_argument("--embed", action="store_true", help="启用第二层语义判定（需要向量器）")
+    intent.add_argument("--llm", action="store_true", help="启用第三层 LLM 兜底")
+    intent.set_defaults(func=cmd_intent)
+
+    ingest = sub.add_parser("ingest", help="跑一遍入库流水线（版面还原/切分/去重/版本），只出报告")
+    ingest.add_argument("--corpus", default=DEFAULT_CORPUS, help="语料目录")
+    ingest.add_argument("--limit", type=int, default=0, help="最多读多少个文件（0=全部）")
+    ingest.add_argument("--out", default="", help="把报告写成 JSON")
+    ingest.set_defaults(func=cmd_ingest)
+
+    stack = sub.add_parser("stack", help="展示运行时链装配顺序（缓存/预算/路由）并做最小验证")
+    stack.add_argument("--query", default="判一下这段证据够不够", help="用于演示的请求内容")
+    stack.add_argument("--budget", type=int, default=20000, help="演示用的 token 预算")
+    stack.add_argument("--embed", action="store_true", help="启用语义缓存（需要向量器）")
+    stack.set_defaults(func=cmd_stack)
+
+    judge = sub.add_parser("judge-compare", help="LLM 裁判 vs 词法归因校验的对照")
+    judge.add_argument("--allow-offline", action="store_true", help="未配置 LLM 时也强行跑（仅供看流程）")
+    judge.set_defaults(func=cmd_judge_compare)
 
     mcp = sub.add_parser("mcp", help="以 MCP Server 运行（stdio，供 Agent 客户端接入）")
     mcp.add_argument("--corpus", default="", help="语料目录，默认 datasets/longdoc-gold")

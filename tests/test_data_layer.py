@@ -82,9 +82,51 @@ def test_cross_page_table_repeats_header() -> None:
 
 
 def test_reading_order_ratio_prefers_coherent_text() -> None:
-    coherent = "第一句结束。第二句开始。第三句结束。第四句开始。"
-    scrambled = "第一句结束第二句开始第三句结束第四句开始第五句结束"
-    assert reading_order_ratio(coherent) >= reading_order_ratio(scrambled)
+    coherent = "\n".join(f"这是第{index}段完整的说明文字，结尾有标点。" for index in range(25))
+    scrambled = "\n".join(f"这是第{index}段被硬断开的文字没有结尾标点" for index in range(25))
+    assert reading_order_ratio(coherent) > 0.9
+    assert reading_order_ratio(scrambled) < 0.2
+
+
+def test_halfwidth_punctuation_is_recognised() -> None:
+    """半角句号 ｡ 是 PDF 转文本的常见变体，必须认。
+
+    真实语料里有一篇用全篇半角句号的文档，早期标点集只认 `。`，
+    结果它每一行都被算成"硬断"，被打 0 分——那不是版面错误，
+    是标点变体没被识别，但报告上看起来像是文档有问题。
+    """
+
+    halfwidth = "\n".join(f"这是第{index}段说明文字，用半角句号结尾｡" for index in range(25))
+    assert reading_order_ratio(halfwidth) > 0.9
+
+
+def test_table_heavy_document_is_not_judged() -> None:
+    """表格密集文档 → "无法判断"（返回 1.0），而不是"不合格"。
+
+    这是真实误杀换来的结论：表格行本来就不以句号结尾，
+    用散文的规矩去量表格，低分反映的是**体裁**，不是错误。
+    用"测不准"去拒绝入库，是把不确定性当成否定证据。
+    """
+
+    rows = ["项目名称 本期金额 上期金额"] + [
+        f"科目{index} 1234567.89 9876543.21" for index in range(40)
+    ]
+    table = "\n".join(rows)
+    assert reading_order_ratio(table) == 1.0, "散文行不足时不该下结论"
+
+    sections, report, _registry = ingest([("table.md", table)])
+    assert report.low_quality == [], "默认不应拒收"
+    assert report.kept >= 1
+    assert "table.md" in report.reading_order, "分数要落到报告里供人工判断"
+
+
+def test_quality_gate_only_acts_when_explicitly_enabled() -> None:
+    """要拒收就必须显式设阈值——让"拦掉一些文档"成为有人签字的动作。"""
+
+    scrambled = "\n".join(f"这是第{index}段被硬断开的文字没有结尾标点字数够了" for index in range(25))
+    sections, report, _registry = ingest([("bad.md", scrambled)], min_reading_order=0.5)
+    assert report.low_quality, "显式设了阈值就该拦"
+    assert sections == []
 
 
 # —— 去重 ——
