@@ -170,6 +170,30 @@ def main() -> int:
         "把检索与生成分开测，两个结论各自干净。\n"
     )
 
+    # —— 难度随前缀的变化：解释"小样本时数字为什么更高" ——
+    # MuSiQue dev 是按顺序取的，前 N 条的难度并不代表全集。
+    # 早期用一个更小的前缀（如 50 条）报过更高的数字，这不是造假，是抽样偏差；
+    # 把这条曲线画出来，才能解释清楚"为什么扩到 300 条之后数字降了"。
+    lines.append("\n## 前缀难度曲线（为什么小样本上的数字更高）\n")
+    lines.append("| 前缀样本数 | 词法重排 Recall@5 | cross-encoder Recall@5 | 差量（pp） |")
+    lines.append("|---|---|---|---|")
+    for prefix in (50, 100, 200, len(samples)):
+        if prefix > len(samples):
+            continue
+        lex = per_config["lexical"]["r5"][:prefix]
+        cross = per_config["cross"]["r5"][:prefix]
+        m_lex = sum(lex) / len(lex)
+        m_cross = sum(cross) / len(cross)
+        lines.append(
+            f"| {prefix} | {m_lex * 100:.1f}% | {m_cross * 100:.1f}% | {(m_cross - m_lex) * 100:+.2f} |"
+        )
+    lines.append("")
+    lines.append(
+        "> 这条曲线的用途是**把抽样偏差摊开**：如果前 50 条明显比全集更容易，"
+        "那么基于前 50 条报出的绝对指标就会偏高。"
+        "**报绝对指标必须用它自己的样本量对应的行，不能拿小样本的行去代表全集。**\n"
+    )
+
     OUT_MD.parent.mkdir(parents=True, exist_ok=True)
     OUT_MD.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines[-24:]))
