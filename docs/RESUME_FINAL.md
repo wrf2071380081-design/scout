@@ -1,62 +1,49 @@
 # 简历定稿 · scout
 
 > **写法说明（不进简历，供你对口径）**
-> 数字全部来自仓库可复现的运行记录，`evals/results/` 与 `reports/` 下有对应报告。
-> 这样写不是保守，是**抗问**：追问三次还站得住的数字，比大一圈但答不上来的数字值钱。
-> 想再推哪一项，告诉我，我把口径和分母一起定好再改。
+> 结构：**4 条核心亮点 + 1 条测试结果**。数字全部来自仓库可复现的运行记录，
+> `evals/results/` 与 `reports/` 下有对应报告。这样写不是保守，是**抗问**——
+> 追问三次还站得住的数字，比大一圈但答不上来的数字值钱。
 
 ---
 
-## 一、项目主条目（简历正文，直接粘贴）
+## 一、项目主条目（简历正文）
 
 **scout · 长文档 Agentic RAG / Agent Runtime 系统**　2026.05 – 至今
-*Python · 混合检索 · Cross-Encoder 重排 · 可恢复运行时 · 模块化评测 · MCP · Chaos Testing*
+*Python · 混合检索 · Cross-Encoder 重排 · 可恢复运行时 · MCP · Chaos Testing*
 
-面向技术文档、政策标准、企业年报等复杂长文档场景的高可靠 Agentic RAG 系统。
+面向技术文档、政策标准、企业年报等复杂长文档的高可靠 Agentic RAG 系统。
 全链路接入真实模型（语义向量 + cross-encoder 神经重排 + 大模型生成），
 自建三层架构（数据层 / 运行时层 / 评测自进化层）与四层评测体系，
 使每个模块可量化、可开关、可回滚。
 
 ---
 
-## 二、Bullet Points（主版本，7 条）
+## 二、Bullet Points（4 条亮点 + 1 条测试结果）
 
-**技术栈：** Python、混合检索、Cross-Encoder 重排、Agent Runtime、HITL、MCP、Chaos Testing
+- **数据层与检索链路**：数据层实现双栏版面还原、跨页表格表头补写与
+  内容哈希 + SimHash 两段去重；检索侧混合召回（稠密 + BM25 + RRF）接 cross-encoder 重排，
+  候选池有界截断（top_k × 4）以控制长尾延迟。
 
-- **双语料基准验证（关键：两套语料各测各的能力）**：
-  ① **长文档自建语料**（40 篇政策标准与年报，19 条人工标注覆盖 14 类查询）——
-  **Recall@1 78.95%、Recall@5 89.47%、目标来源命中率 100%、
-  拒答正确率 100%、误拒率 0%、作答率 68.42%**；
-  ② **MuSiQue-Ans 公开多跳基准**（1000 段联合检索池，50 条冻结样本）——
-  **Recall@5 48.0%（bootstrap 95% CI [39.0, 57.0]）、Recall@10 53.0%，
-  零编造**。两套基准分别覆盖「长文档解析+检索」与「多跳推理+防幻觉拒答」。
+- **检索核心杠杆被量化**：同一批样本、同一份语料，仅替换重排器
+  （词法重排 → cross-encoder `bge-reranker`），**端到端作答率 7% → 24%、
+  Recall@5 26.7% → 48.0%**——用消融证明"十七个百分点的结构改动"优于"三个百分点的调参"。
 
-- **检索侧核心杠杆被量化**：同一批样本、同一份语料，仅替换重排器
-  （**词法重排 → cross-encoder `bge-reranker`**），
-  **端到端作答率 7% → 24%，Recall@5 26.7% → 48.0%**；
-  配套给出逐题排名对照与候选池有界截断策略（top_k × 4，避免重排拖垮长尾）。
-
-- **拒答是被数据驱动的，不是全局保守**：同一套系统在**中文长文档上作答率 68.42%**、
-  在**英文多跳（中文专用向量模型）上 24%**——拒答率随语料与语言匹配度变化，
-  且两组都做到**幻觉率 0%、误拒率 0%**。幻觉率与误拒率分列管理，不合并成一个"拒答率"。
-
-- **三层架构**：**数据层**（双栏版面还原、跨页表格表头补写、内容哈希 + SimHash 两段去重、
-  `doc_id + 版本 + 模型版本` 派生的缓存键）——在真实语料上**挡下 115 个重复片段（13%）**、
-  对 2 篇双栏文档**重排 660 行**；**运行时层**（三级意图漏斗、作用域隔离的语义缓存、
-  模型路由与成本账本、Token 预扣/硬上限/结算）；**评测自进化层**
-  （去偏 LLM 裁判、失败挖掘 → 复核队列的数据飞轮、带证据等级的参数建议）。
+- **拒答可校准，不是全局保守**：幻觉率与误拒率分列管理（不合并成一个"拒答率"）；
+  同一套门控在**中文长文档上误拒率 0%、作答率 68.4%**，在**英文多跳上作答率 24%**——
+  拒答率随语料与语言匹配度变化，且两组都做到**零编造**。
 
 - **可恢复的 Agent 运行时**：统一三种状态后端（Memory / JSONL / **Redis**）；
-  HITL 风险分级审批与审批中动态改参；**副作用按调用槽位血缘做幂等，
-  断点恢复不重放副作用**；支持按 Step 分叉的时间旅行；审批超时默认 Safe-Reject（fail-closed）。
+  HITL 风险分级审批与审批中动态改参；**副作用按调用槽位血缘幂等，断点恢复不重放**；
+  支持按 Step 分叉的时间旅行，审批超时默认 Safe-Reject（fail-closed）。
 
-- **工程可靠性（Chaos Testing）**：故障注入覆盖 8 类典型故障，实现
-  **故障类型化捕获率 100%（8/8 injected faults typed）、预算内恢复率 100%、
-  未捕获裸异常 0**；**175 项单测与集成测试全绿**（含离线替身模式，克隆即可跑、无需 API Key）。
-
-- **易用性与集成**：手写 stdio **MCP Server**（零新增依赖）把检索与问答暴露为标准工具；
-  Web 控制台提供链路透视（每阶段真实 trace）、审批台、**SSE 流式问答**（阶段级 + token 级）；
-  `scout doctor` 一键体检各部件当前是真实模型还是离线替身。
+- **测试结果**：长文档自建语料（40 篇 / 19 条人工标注 / 14 类查询）
+  **Recall@1 78.95%、Recall@5 89.47%、拒答正确率 100%、误拒率 0%、作答率 68.42%**；
+  MuSiQue-Ans 公开多跳基准（1000 段联合检索池、50 条冻结样本）
+  **Recall@5 48.0%（bootstrap 95% CI [39.0, 57.0]）、Recall@10 53.0%、零编造**；
+  数据层实测**挡下 13% 重复片段**、双栏**重排 660 行**；
+  8 类故障注入实现**故障类型化捕获 100%、预算内恢复 100%、裸异常 0**；
+  **175 项测试全绿**（含离线替身模式，无需 API Key）；零依赖 stdio MCP Server + SSE 链路透视控制台。
 
 ---
 
@@ -77,48 +64,40 @@
 
 ---
 
-## 四、一页版（空间紧张时用）
-
-> **scout · 长文档 Agentic RAG / Agent Runtime**（Python · 混合检索 · Cross-Encoder · 可恢复运行时）
-> 全链路真实模型的 Agent 系统。长文档自建语料 **Recall@1 78.95%、拒答正确率 100%、误拒率 0%、
-> 作答率 68.42%**；MuSiQue-Ans 公开多跳基准 **Recall@5 48.0%（CI [39.0, 57.0]）、零编造**。
-> 仅替换重排器（词法 → cross-encoder）即把端到端作答率从 **7% 提到 24%**。
-> 数据层去重挡下 13% 重复片段；运行时支持幂等副作用、Redis 状态、时间旅行；
-> 8 类故障注入 100% 类型化捕获，175 项测试全绿离线可跑。
-
----
-
-## 五、英文版（外企投递）
+## 四、英文版（外企投递，同结构）
 
 **scout — Long-document Agentic RAG & Agent Runtime** *2026.05 – Present*
 *Python · Hybrid Retrieval · Cross-encoder Reranking · Durable Execution · MCP · Chaos Testing*
 
-- Built an end-to-end agent system over complex long documents with a **fully real model chain**
-  (semantic embeddings + cross-encoder reranker + LLM), organized in three layers: data
-  (dual-column layout restoration, cross-page table header repair, two-stage dedup, lineage),
-  runtime (tiered intent funnel, scope-isolated semantic cache, model routing, token
-  reserve/settle budget), and evaluation/self-improvement (debiased LLM judge, failure-mining
-  flywheel).
-- **Evaluated on two corpora covering two different capabilities**: in-house long-document corpus
-  (40 documents, 19 human-labelled cases across 14 query types) — **Recall@1 78.95%,
-  abstention accuracy 100%, false-refusal rate 0%, answer rate 68.42%**; and the public
-  **MuSiQue-Ans** multi-hop benchmark — **Recall@5 48.0% (95% CI [39.0, 57.0]), zero fabricated
-  answers**, with hallucination and false-refusal tracked as separate metrics.
-- **Quantified the single biggest lever in retrieval**: swapping the lexical reranker for a
-  cross-encoder raised the end-to-end answer rate from **7% to 24%** and Recall@5 from
-  26.7% to 48.0% on identical samples, with a bounded candidate pool (top_k × 4).
-- Data layer removed **115 duplicate chunks (13% of 886)** via exact hashing + SimHash, and
-  reordered **660 lines across 2 dual-column documents**.
-- Durable runtime: three swappable checkpoint backends (Memory / JSONL / **Redis**),
+High-reliability agent system over complex long documents (technical specs, policy standards,
+annual reports), with a fully real model chain — semantic embeddings, cross-encoder reranking,
+and LLM generation — organized into three layers (data / runtime / evaluation) and a four-layer
+evaluation suite that makes every module measurable, toggleable, and revertible.
+
+- **Data layer & retrieval pipeline**: dual-column layout restoration, cross-page table header
+  repair, exact-hash + SimHash two-stage dedup; hybrid recall (dense + BM25 + RRF) feeding a
+  cross-encoder reranker with a bounded candidate pool (top_k × 4).
+- **Quantified the biggest lever in retrieval**: on identical samples, replacing the lexical
+  reranker with a cross-encoder raised the end-to-end answer rate from **7% to 24%** and
+  Recall@5 from 26.7% to 48.0% — structural change beats threshold tuning.
+- **Calibrated abstention, not blanket conservatism**: hallucination and false-refusal tracked
+  separately; the same gate achieves **0% false refusal / 68.4% answer rate on Chinese long
+  documents** versus **24% answer rate on English multi-hop** — both with **zero fabrication**.
+- **Durable agent runtime**: three swappable checkpoint backends (Memory / JSONL / **Redis**),
   risk-tiered HITL approval with in-flight parameter editing, **idempotent side effects keyed by
-  calling-slot lineage** (no replay on resume), step-level time travel, fail-closed approval timeout.
-- Reliability: 8-class fault injection with **100% typed fault capture (8/8), 100% in-budget
-  recovery, 0 uncaught exceptions**; **175 tests green**, reproducible offline with no API key;
-  zero-dependency stdio **MCP server** exposing retrieval and QA as standard tools.
+  calling-slot lineage** (no replay on resume), step-level time travel, fail-closed timeout.
+- **Results**: in-house long-document corpus (40 docs / 19 labelled cases / 14 query types) —
+  **Recall@1 78.95%, Recall@5 89.47%, abstention accuracy 100%, false-refusal rate 0%,
+  answer rate 68.42%**; public **MuSiQue-Ans** multi-hop benchmark —
+  **Recall@5 48.0% (95% CI [39.0, 57.0]), Recall@10 53.0%, zero fabrication**;
+  dedup removed **13% duplicate chunks** and layout restoration reordered **660 lines**;
+  8-class fault injection with **100% typed fault capture, 100% in-budget recovery,
+  0 uncaught exceptions**; **175 tests green**, reproducible offline with no API key;
+  zero-dependency stdio **MCP server** plus an SSE trace console.
 
 ---
 
-## 六、面试开场（60 秒，背熟）
+## 五、面试开场（60 秒，背熟）
 
 > 「scout 是一个长文档 Agent 系统，检索链路全部换成了真实模型。
 >
@@ -140,7 +119,7 @@
 
 ---
 
-## 七、四个"怪异点"的标准答法（外部诊断提出，已核对事实）
+## 六、四个"怪异点"的标准答法（外部诊断提出，已核对事实）
 
 ### 1. 「基准错位：做了长文档解析，却用 Wikipedia 多跳数据集评测」
 
@@ -207,7 +186,7 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 
 ---
 
-## 八、这次改稿的取舍（只给你看）
+## 七、这次改稿的取舍（只给你看）
 
 **采纳外部诊断的**：① 基准错位要正面回应（但用数字而不是解释）；
 ② 5s 延迟不该上简历；③ "类型化失败率"措辞歧义（已改成"类型化捕获率"）；
@@ -222,6 +201,10 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 **修正外部终版的三处事实错误**：
 ① 「BM25 → bge-reranker」标错了：BM25 是**稀疏召回通道**，被替换的是**词法重排器**；
 ② 测试数 163 → **175**；③ 补上长文档那组数字（那正是第 1 条质疑的答案）。
+
+**结构上的取舍（按你的要求）**：合并为 **4 条亮点 + 1 条测试结果**，
+删掉了原先那个"没有分点的纯段落一页版"——主版本已经足够紧凑，本身就是一页版。
+可靠性数字（故障注入 / 测试数 / MCP）并入测试结果那条，不再单占一点。
 
 **删掉的**：所有"样本量小""只具方向性""未做分布式压测""未做多租户"这类定语。
 简历不该写免责声明——那是技术文档的职责。
