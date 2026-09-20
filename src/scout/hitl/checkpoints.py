@@ -311,12 +311,128 @@ class AgentState:
         return TokenUsage(input_tokens=self.input_tokens, output_tokens=self.output_tokens)
 
 
+class RedisCheckpointStore:
+    """Redis 存储：把状态从进程里搬出去。
+
+    **为什么状态必须外置**（这是"算力受限/多副本"场景下的硬要求）：
+
+    - 进程随时可能被调度、重启、扩缩容——状态放内存就跟着一起没了；
+    - 多副本要共享同一份会话状态，才能把请求负载均衡到任意一台；
+    - HITL 场景更狠：用户看到的是"等待审批"，如果这时进程重启而状态丢了，
+      那次审批永远等不到结果，**会话永久卡死**。
+
+    代价是多一跳网络往返；用连接池与管道把这一跳压到亚毫秒级即可接受。
+
+    **存储形态与文件版保持一致**：同样用 append-only 列表
+    （Redis LIST 的 ``RPUSH``），这样时间旅行、审计、"崩溃最多丢最后一行"
+    这些性质在两个后端上是同一套语义——**换后端不该换语义**。
+
+    :param url: redis://host:port/db，或直接注入 ``client``（测试用）。
+    :param ttl_seconds: 过期时间。生产上要设——不然 run 会无限堆积。
+    """
+
+    SCHEMA = "scout:ckpt"
+
+    def __init__(
+        self,
+        url: str = "redis://127.0.0.1:6379/0",
+        *,
+        client: Any = None,
+        prefix: str = SCHEMA,
+        ttl_seconds: int = 7 * 24 * 3600,
+    ) -> None:
+        self.prefix = prefix
+        self.ttl_seconds = ttl_seconds
+        if client is not None:
+            self._client = client
+        else:
+            try:
+                import redis  # noqa: PLC0415 - 可选依赖，用到才导入
+            except ImportError as exc:  # pragma: no cover - 取决于环境
+                raise ScoutError(
+                    "未安装 redis 客户端，无法使用 RedisCheckpointStore。"
+                    "安装：pip install redis（或把 CheckpointStore 换成 FileCheckpointStore）",
+                    code=ErrorCode.PROVIDER_UNAVAILABLE,
+                ) from exc
+            self._client = redis.Redis.from_url(url, decode_responses=True)
+
+    def _key(self, run_id: str) -> str:
+        safe = "".join(char for char in run_id if char.isalnum() or char in "-_.")
+        if not safe:
+            raise ScoutError("非法的 run_id", code=ErrorCode.VALIDATION_FAILED)
+        return f"{self.prefix}:{safe}"
+
+    def save(self, checkpoint: Checkpoint) -> None:
+        key = self._key(checkpoint.run_id)
+        payload = json.dumps(checkpoint.to_dict(), ensure_ascii=False, default=str)
+        pipe = self._client.pipeline()
+        pipe.rpush(key, payload)
+        if self.ttl_seconds > 0:
+            # 每次写入续期：活跃会话不该因为"最后写入了 7 天前"而消失
+            pipe.expire(key, self.ttl_seconds)
+        pipe.execute()
+
+    def history(self, run_id: str) -> list[Checkpoint]:
+        raw = self._client.lrange(self._key(run_id), 0, -1) or []
+        items: list[Checkpoint] = []
+        for line in raw:
+            text = line.decode("utf-8") if isinstance(line, bytes) else str(line)
+            try:
+                items.append(Checkpoint.from_dict(json.loads(text)))
+            except (json.JSONDecodeError, ScoutError):
+                # 与文件版同一约定：坏行跳过。append-only 的语义是"前面写成功了"。
+                continue
+        return items
+
+    def latest(self, run_id: str) -> Checkpoint | None:
+        raw = self._client.lindex(self._key(run_id), -1)
+        if not raw:
+            return None
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        try:
+            return Checkpoint.from_dict(json.loads(text))
+        except (json.JSONDecodeError, ScoutError):
+            items = self.history(run_id)
+            return items[-1] if items else None
+
+    def at(self, run_id: str, step: int) -> Checkpoint | None:
+        for checkpoint in reversed(self.history(run_id)):
+            if checkpoint.step == step:
+                return checkpoint
+        return None
+
+    def runs(self) -> list[str]:
+        keys = self._client.keys(f"{self.prefix}:*") or []
+        prefix_len = len(self.prefix) + 1
+        return sorted(
+            (key.decode("utf-8") if isinstance(key, bytes) else str(key))[prefix_len:] for key in keys
+        )
+
+
+def build_checkpoint_store(url: str = "", *, root: str | None = None) -> CheckpointStore:
+    """按配置挑一个存储后端，**并且明确告诉调用方挑到了哪一个**。
+
+    选择顺序：显式 Redis URL → 文件目录 → 内存。
+    之所以不让它"自动尝试 Redis 失败再降级"：状态存储降级是**重大语义变化**
+    （从"跨进程可恢复"变成"重启即丢"），必须由调用方显式决定，
+    而不是被一个隐式 fallback 悄悄换掉。
+    """
+
+    if url:
+        return RedisCheckpointStore(url)
+    if root:
+        return FileCheckpointStore(root)
+    return InMemoryCheckpointStore()
+
+
 __all__ = [
     "AgentState",
     "Checkpoint",
     "CheckpointStore",
     "FileCheckpointStore",
     "InMemoryCheckpointStore",
+    "RedisCheckpointStore",
+    "build_checkpoint_store",
     "message_from_dict",
     "message_to_dict",
     "messages_from_dicts",

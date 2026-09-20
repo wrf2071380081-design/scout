@@ -133,9 +133,22 @@ class PipelineResult:
         return payload
 
 
+# 惰性导入：``scout.runtime`` 会在导入期反向依赖 ``scout.rag.embed``，
+# 顶层导入会形成包级循环。放在函数内既断开循环，也符合"流式是可选能力"的语义。
+def _collect_stream(*args: Any, **kwargs: Any):
+    from ..runtime.stream import collect_stream
+
+    return collect_stream(*args, **kwargs)
+
+
+def _stream_supports(client: Any) -> bool:
+    from ..runtime.stream import supports_streaming
+
+    return supports_streaming(client)
+
+
 class RAGPipeline:
     """可配置、可观测、可消融的 RAG 流水线。"""
-
     def __init__(
         self,
         index: HybridIndex,
@@ -340,7 +353,15 @@ class RAGPipeline:
 
     # —— 生成 ——
 
-    def _generate(self, question: str, units: list[EvidenceUnit], trace: Trace, *, strict: bool = False) -> str:
+    def _generate(
+        self,
+        question: str,
+        units: list[EvidenceUnit],
+        trace: Trace,
+        *,
+        strict: bool = False,
+        on_token: Any = None,
+    ) -> str:
         packed, _dropped = pack_evidence(units, budget_chars=self.settings.retrieval.evidence_budget_chars)
         prompt = ANSWER_PROMPT.format(question=question, evidence=format_evidence(packed) or "（无证据）")
         if strict:
@@ -349,16 +370,24 @@ class RAGPipeline:
                 "这一版必须做到每一句话都能在证据里找到出处，无法支撑的内容直接省略。\n\n" + prompt
             )
         with trace.step("generate", StepKind.GENERATE, evidence=len(packed), strict=strict) as step:
-            response = self.llm.complete(
-                LLMRequest(
-                    messages=[ChatMessage(role="user", content=prompt)],
-                    task="answer",
-                    context={"question": question, "evidence_count": len(packed)},
-                )
+            request = LLMRequest(
+                messages=[ChatMessage(role="user", content=prompt)],
+                task="answer",
+                context={"question": question, "evidence_count": len(packed)},
             )
-            step.outputs = {"answer_chars": len(response.content)}
-            step.metrics = response.usage.to_dict()
-        return response.content.strip()
+            if on_token is not None and _stream_supports(self.llm):
+                # 有流式能力且调用方要流：逐片吐出，同时收齐完整文本。
+                # 流式与阻塞走**同一段提示词与同一条证据**，
+                # 否则"流式"会悄悄变成另一个系统，两边结果对不上。
+                outcome = _collect_stream(self.llm, request, on_token=on_token)
+                content = outcome.text
+                step.metrics = outcome.usage.to_dict()
+            else:
+                response = self.llm.complete(request)
+                content = response.content
+                step.metrics = response.usage.to_dict()
+            step.outputs = {"answer_chars": len(content)}
+        return content.strip()
 
     # —— 检索编排（流水线与 Agent 工具共用同一段实现） ——
 
@@ -408,13 +437,17 @@ class RAGPipeline:
 
     # —— 主入口 ——
 
-    def answer(self, question: str, on_stage: Any = None) -> PipelineResult:
+    def answer(self, question: str, on_stage: Any = None, on_token: Any = None) -> PipelineResult:
         """执行一次完整问答。
 
         ``on_stage`` 是可选的阶段回调：签名 ``(stage, payload)``，在每个
         真实的工作边界上被调用一次——retrieve / grade / rewrite / sanitize /
         generate / grounding / done。Web 控制台与评测的 SSE 输出就靠它，
         而不是靠对边界的猜测。**阶段钩子必须落在真实断点上，伪造的阶段比没有更糟。**
+
+        ``on_token`` 是可选的增量回调：签名 ``(piece: str)``。
+        给到它且底层客户端支持流式时，生成阶段改为逐片产出（首 token 延迟大幅下降）；
+        客户端不支持时自动退化为一次性返回——调用方不需要写两个分支。
         """
 
         def emit(stage: str, payload: dict[str, Any]) -> None:
@@ -477,7 +510,7 @@ class RAGPipeline:
             emit("done", {"outcome": result.outcome})
             return result
 
-        answer = self._generate(question, units, trace)
+        answer = self._generate(question, units, trace, on_token=on_token)
         emit("generate", {"chars": len(answer), "regenerations": 0})
         grounding: GroundingReport = verify_answer(
             question,

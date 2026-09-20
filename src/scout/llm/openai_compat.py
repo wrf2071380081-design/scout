@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -247,6 +247,66 @@ class OpenAICompatLLM:
             provider="llm",
             operation="chat",
         )
+
+
+    # —— 流式 ——
+
+    def complete_stream(self, request: LLMRequest) -> Iterator[str]:
+        """流式生成，逐片产出增量文本。
+
+        **三个实现要点，每个都在线上咬过人：**
+
+        1. **SSE 分片不按行对齐。** 网络返回的 chunk 可能把一行 JSON 切成两半，
+           所以必须自己维护缓冲区、按 ``\\n`` 切分，而不是"一次 read = 一条事件"。
+        2. **不重试。** 流式已经吐出去的内容收不回来，中途重试会导致内容重复。
+           失败就让调用方感知（抛 :class:`ProviderError`），由上层决定是否重来。
+           这与 ``complete`` 的重试策略刻意不同——**语义不同，策略就不该一样**。
+        3. **遇 ``[DONE]`` 或迭代结束都要干净收尾。** 有些网关不发 ``[DONE]``，
+           不能依赖它来判断结束。
+        """
+
+        payload = self._payload(request)
+        payload["stream"] = True
+        # 流式下不请求 usage：多数网关最后一帧才补，反而容易卡住收尾
+        payload.pop("response_format", None)
+
+        try:
+            response = requests.post(
+                self._endpoint(),
+                headers=self._headers(),
+                json=payload,
+                timeout=self._remaining_timeout(request.deadline),
+                stream=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一归一化
+            classified = self._classify(exc)
+            if classified is None:
+                raise
+            raise classified from exc
+
+        if not response.ok:
+            raise self._classify_status(response.status_code, response.text)
+
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            text = line.strip()
+            if not text.startswith("data:"):
+                continue
+            data = text[len("data:") :].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                yield str(piece)
 
 
 def build_tool_payload(tools: list[ToolSchema]) -> list[dict[str, Any]]:

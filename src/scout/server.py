@@ -382,13 +382,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             stages.append({"stage": stage, **payload})
             send("stage", {"stage": stage, **payload})
 
+        tokens = {"count": 0, "chars": 0}
+
+        def on_token(piece: str) -> None:
+            """token 级增量下发。这是"首 token 延迟"真正被感知到的地方——
+            阶段事件告诉你它在忙什么，token 事件让你马上看到字。"""
+
+            tokens["count"] += 1
+            tokens["chars"] += len(piece)
+            send("token", {"text": piece})
+
         try:
             if mode == "multiagent":
                 result = self.app.orchestrator.answer(question, on_stage=on_stage)
                 payload = self.app._multiagent_payload(result)  # noqa: SLF001 - 同一个模块内部
             else:
-                result = self.app.pipeline.answer(question, on_stage=on_stage)
+                result = self.app.pipeline.answer(question, on_stage=on_stage, on_token=on_token)
                 payload = self.app._pipeline_payload(result)  # noqa: SLF001
+            payload["stream"] = {"tokens": tokens["count"], "chars": tokens["chars"]}
             send("result", payload)
         except Exception as exc:  # noqa: BLE001 - 流式中断不能把异常留给某个写死的连接
             send("error", {"error": type(exc).__name__, "detail": str(exc)[:300]})
