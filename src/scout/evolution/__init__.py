@@ -34,6 +34,12 @@ from .flywheel import (
     export_preference_pairs,
 )
 from .judge import JudgeCalibration, JudgeVerdict, LLMJudge
+from .observations import (
+    FlywheelReport,
+    ObservationLog,
+    mine_report,
+    observation_from_pipeline,
+)
 from .tuner import ParamSuggestion, ParamTuner
 
 __all__ = [
@@ -41,14 +47,18 @@ __all__ = [
     "FailureMiner",
     "FailureReason",
     "FlywheelLedger",
+    "FlywheelReport",
     "FlywheelTurn",
     "JudgeCalibration",
     "JudgeVerdict",
     "LLMJudge",
     "MineStats",
+    "ObservationLog",
     "ParamSuggestion",
     "ParamTuner",
     "ReviewQueue",
     "candidate_id",
     "export_preference_pairs",
+    "mine_report",
+    "observation_from_pipeline",
 ]

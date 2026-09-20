@@ -41,9 +41,38 @@ scout intent        # 看意图三层漏斗停在哪一层、为什么（--embed
 scout ingest        # 跑一遍入库流水线：版面还原/切分/去重/版本，只出报告
 scout stack         # 展示运行时链装配顺序，并现场验证缓存命中不花钱
 scout judge-compare # LLM 裁判 vs 词法归因校验的对照（含不一致清单）
+scout flywheel      # 数据飞轮：观测 → 挖掘 → 复核 → 评测集增量
 scout serve         # 启动 Web 控制台（链路透视 + 审批台 + SSE 流式问答）
 scout mcp           # 以 MCP Server 运行，供任意 Agent 客户端接入
 ```
+
+### 数据飞轮真转一圈（实测记录）
+
+```bash
+# 1) 在评测集之外的部分跑评测，把观测落盘
+scout eval run --dataset evals/longdoc_v2_draft.json --skip 19 --limit 90 \
+  --observations-out reports/observations.jsonl
+# 2) 挖掘 → 复核 → 写出增量
+scout flywheel --observations reports/observations.jsonl \
+  --dataset evals/longdoc_v1.json --out evals/longdoc_v1_flywheel.json --approve-all
+```
+
+```
+读取观测 120 条（按问题去重后 90 个）
+其中：拒答 18 ｜ 低支撑 0 ｜ 空检索 0
+挖出候选 18 条 → 复核通过 18 条
+评测集：19 → 37
+```
+
+> **飞轮只在有失败时才产出。** 同一次尝试里另一批 30 条观测全部答对，
+> 结果是"挖出 0 条"——这不是 bug，是它诚实的表现。
+>
+> **另一条同样重要的经验**：如果拿评测集**自己**的观测去喂飞轮，
+> 结果是零增长（挖出来的问题都已在集合里）。飞轮的增量来自
+> **评测集之外的真实流量**——这个坑很隐蔽，结果看起来像"飞轮没用"。
+>
+> 新样本的 gold 一律**留空**：自动挖掘可以扩大候选池，
+> 但不能自己决定"什么算答对"。它们只有经过人工补标才有资格进主评测集。
 
 ### 在真实语料上跑一遍 `scout ingest`（40 篇长文档）
 

@@ -139,8 +139,16 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
         mode=args.mode,
         label=args.label or "",
         limit=args.limit,
+        skip=args.skip,
     )
     report = run_evaluation(dataset, documents, run_config=config)
+
+    if getattr(args, "observations_out", ""):
+        from .evolution.observations import ObservationLog
+
+        log = ObservationLog(args.observations_out)
+        written = log.extend(report.observations)
+        print(f"观测已写入：{args.observations_out}（{written} 条）")
 
     if args.out:
         path = Path(args.out)
@@ -492,6 +500,160 @@ def cmd_judge_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_flywheel(args: argparse.Namespace) -> int:
+    """把数据飞轮转一圈：观测 → 挖掘 → 复核 → 评测集增量。
+
+    **这一步的产物是"候选"，不是"新评测集"。**
+    挖掘是自动的，入库必须有人签字——模型判错的样本里混着
+    "这题本来就不该答"。直接把它当"应该答对"的样本加进评测集，
+    会系统性地惩罚一个行为正确的系统：门控被越调越松，最后变成自信胡说。
+
+    所以本命令产出两样东西：
+    - 复核队列文件（JSONL，带证据，供人逐条补 gold）
+    - 数据集增量（``--out``），每条都带"由飞轮挖出、待补标"的诚实标记
+    """
+
+    from .evolution import FailureMiner, ReviewQueue
+    from .evolution.observations import FlywheelReport, ObservationLog, mine_report
+    from .evaluation.dataset import EvalCase, EvalDataset, load_dataset, save_dataset
+
+    log = ObservationLog(args.observations)
+    records = log.read()
+    if not records:
+        print(f"观测文件为空或不存在：{args.observations}")
+        print("先用 `scout eval run --observations-out <path>` 产出观测。")
+        return 1
+
+    summary = mine_report(records)
+    print(f"读取观测 {summary['total']} 条（去重后 {summary['unique_questions']} 个问题）")
+    print(f"  其中：拒答 {summary['abstained']} ｜ 低支撑 {summary['low_support']} ｜ 空检索 {summary['empty_retrieval']}")
+    print("-" * 72)
+
+    miner = FailureMiner()
+    candidates = miner.mine(records)
+    queue = ReviewQueue()
+    added = queue.enqueue(candidates)
+
+    print(f"挖出候选 {len(candidates)} 条（新入队 {added} 条）")
+    print("来源分布：" + (", ".join(f"{k}={v}" for k, v in sorted(miner.stats.by_reason.items())) or "无"))
+    print()
+
+    if args.list_only:
+        for case in queue.sample_pending(limit=args.limit):
+            print(f"  [{case.reason.value:<18}] {case.question[:60]}")
+            print(f"      证据 {case.retrieved} 条 ｜ 支撑率 {case.support_rate:.2f} ｜ 结果 {case.outcome}")
+        print()
+        print("加 --approve N 复核通过前 N 条，或 --approve-all 全部通过并写出增量。")
+        return 0
+
+    approve_count = len(queue.pending) if args.approve_all else max(0, args.approve)
+    approved = []
+    for case in queue.sample_pending(limit=approve_count or len(queue.pending)):
+        decided = queue.approve(case.case_id)
+        if decided is not None:
+            approved.append(decided)
+    for case in list(queue.pending.values()):
+        queue.reject(case.case_id, "本轮未复核（留待下一轮）")
+
+    print(f"复核：通过 {len(approved)} 条，拒绝/待定 {len(queue.rejected)} 条")
+
+    dataset = load_dataset(args.dataset)
+    before = len(dataset.cases)
+    existing = {case.question for case in dataset.cases}
+    increment: list[EvalCase] = []
+    skipped_existing = 0
+    for case in approved:
+        if case.question in existing:
+            skipped_existing += 1
+            continue
+        increment.append(
+            EvalCase(
+                case_id=case.case_id,
+                question=case.question,
+                tags=list(_guess_tags(case)),
+                # gold 留空：我们不知道正确答案，只有人补标之后才有资格进主评测集。
+                # 这正是"候选"与"样本"的区别。
+                gold_snippets=[],
+                allow_unknown=True,
+                notes=f"飞轮挖出：{case.reason.value}｜观测结果 {case.outcome}｜支撑率 {case.support_rate:.2f}｜待补 gold",
+            )
+        )
+
+    if skipped_existing:
+        # 把"被跳过"显式说出来。**从自己的评测集里挖，是挖不出新东西的**——
+        # 这是飞轮的常见误解：它的增量来自"评测集之外的真实流量"，
+        # 拿评测集自己的观测来喂它，结果一定是零增长，而且看起来像 bug。
+        print(f"跳过 {skipped_existing} 条：问题已在评测集中（挖掘用观测应当来自评测集之外）")
+
+    merged = list(dataset.cases) + increment
+    if args.out:
+        save_dataset(
+            EvalDataset(
+                name=dataset.name + "-flywheel",
+                cases=merged,
+                description=dataset.description,
+                corpus_fingerprint=dataset.corpus_fingerprint,
+            ),
+            args.out,
+        )
+
+    report = FlywheelReport(
+        observations=summary["total"],
+        mined=len(candidates),
+        approved=len(approved),
+        rejected=len(queue.rejected),
+        dataset_before=before,
+        dataset_after=len(merged),
+        by_reason=dict(miner.stats.by_reason),
+        output_path=args.out or "",
+        skipped_existing=skipped_existing,
+        new_cases=len(increment),
+    )
+    print()
+    print(report.render())
+
+    if args.report:
+        path = Path(args.report)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# 数据飞轮一轮\n\n"
+            "## 观测摘要\n\n"
+            f"- 观测 {summary['total']} 条（去重后 {summary['unique_questions']} 个问题）\n"
+            f"- 拒答 {summary['abstained']} ｜ 低支撑 {summary['low_support']} ｜ 空检索 {summary['empty_retrieval']}\n\n"
+            "## 飞轮结果\n\n" + report.render() +
+            "\n## 候选清单\n\n" + "\n".join(
+                f"- `{case.reason.value}` {case.question[:70]}（证据 {case.retrieved}，支撑率 {case.support_rate:.2f}）"
+                for case in approved
+            ) + "\n",
+            encoding="utf-8",
+        )
+        print(f"报告已写入 {args.report}")
+
+    print()
+    print("注意：新增样本的 gold 留空 —— 它们只有经过人工补标才有资格进主评测集。")
+    print("自动挖掘可以扩大候选池，但不能自己决定'什么算答对'。")
+    return 0
+
+
+def _guess_tags(case: Any) -> list[Any]:
+    """从失败画像猜查询类型，只作为给复核人的初始建议。
+
+    **刻意只猜"类型"，不猜"答案"。** 类型可以从证据数量与检索行为推出来，
+    而"正确答案是什么"推不出来——那必须由人给。
+    """
+
+    from .evaluation.taxonomy import QueryTag
+
+    tags: list[QueryTag] = []
+    if case.retrieved >= 4:
+        tags.append(QueryTag.MULTI_HOP)
+    else:
+        tags.append(QueryTag.SINGLE_FACT)
+    if case.reason.value == "abstained":
+        tags.append(QueryTag.NO_KNOWLEDGE)
+    return tags
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     """体检：报告当前哪些部件是"真实模型"，哪些还是离线替身。
 
@@ -627,6 +789,17 @@ def build_parser() -> argparse.ArgumentParser:
     judge.add_argument("--allow-offline", action="store_true", help="未配置 LLM 时也强行跑（仅供看流程）")
     judge.set_defaults(func=cmd_judge_compare)
 
+    flywheel = sub.add_parser("flywheel", help="数据飞轮：观测 → 挖掘 → 复核 → 评测集增量")
+    flywheel.add_argument("--observations", default="reports/observations.jsonl", help="观测日志（JSONL）")
+    flywheel.add_argument("--dataset", default=DEFAULT_DATASET, help="当前评测集")
+    flywheel.add_argument("--out", default="", help="写出增量后的评测集")
+    flywheel.add_argument("--report", default="", help="写出 Markdown 报告")
+    flywheel.add_argument("--approve", type=int, default=0, help="复核通过前 N 条")
+    flywheel.add_argument("--approve-all", action="store_true", help="全部通过（谨慎）")
+    flywheel.add_argument("--list-only", action="store_true", help="只看候选，不写任何东西")
+    flywheel.add_argument("--limit", type=int, default=20, help="展示候选条数上限")
+    flywheel.set_defaults(func=cmd_flywheel)
+
     mcp = sub.add_parser("mcp", help="以 MCP Server 运行（stdio，供 Agent 客户端接入）")
     mcp.add_argument("--corpus", default="", help="语料目录，默认 datasets/longdoc-gold")
     mcp.set_defaults(func=cmd_mcp)
@@ -656,10 +829,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--mode", choices=("pipeline", "agent", "multiagent"), default="pipeline")
     run.add_argument("--label", default="")
     run.add_argument("--limit", type=int, default=None)
+    run.add_argument("--skip", type=int, default=0, help="跳过前 N 条（用于只跑评测集之外的部分）")
     run.add_argument("--max-files", type=int, default=None)
     run.add_argument("--out", default="")
     run.add_argument("--markdown", default="")
     run.add_argument("--fail-under", type=float, default=None, help="Recall@5 低于该值时返回非零退出码")
+    run.add_argument(
+        "--observations-out",
+        default="",
+        help="把本次评测的结构化观测追加到 JSONL（供数据飞轮挖掘）",
+    )
     run.set_defaults(func=cmd_eval_run)
 
     ablation = eval_sub.add_parser("ablation", help="运行模块级消融")

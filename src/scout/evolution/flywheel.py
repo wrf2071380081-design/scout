@@ -28,7 +28,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 class FailureReason(str, Enum):
@@ -95,14 +95,54 @@ def candidate_id(question: str) -> str:
     return f"cand-{digest}"
 
 
+def _field(item: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+    """按多个候选键名取值。
+
+    **为什么需要它（一次真实的静默失败）。** 挖掘器最初只认 ``retrieved``
+    和 ``support_rate`` 两个键，而观测日志写的是 ``retrieved_sources``
+    与 ``answer_support_rate``。字段名不一致不会有任何报错：
+    取值全为 None → 检索数量当 0 → 每条观测都被判成"空检索"并被跳过。
+    结果是**飞轮转了一圈挖出 0 条候选，而报告上一切正常**。
+
+    这就是"跑一圈"不可替代的原因：单测里两边各自都对，
+    只有端到端接起来才会暴露字段错配。
+
+    兼容多个键名的代价是可接受的；真正的风险是**只认一个名字还不报错**。
+    """
+
+    for name in names:
+        if name in item and item[name] is not None:
+            return item[name]
+    return default
+
+
+def _as_count(value: Any) -> int:
+    """把"数量"或"列表"统一成 int。"""
+
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass(slots=True)
 class MineStats:
     scanned: int = 0
     mined: int = 0
+    skipped_no_retrieval: int = 0
     by_reason: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"scanned": self.scanned, "mined": self.mined, "by_reason": dict(self.by_reason)}
+        return {
+            "scanned": self.scanned,
+            "mined": self.mined,
+            "skipped_no_retrieval": self.skipped_no_retrieval,
+            "by_reason": dict(self.by_reason),
+        }
 
 
 class FailureMiner:
@@ -126,21 +166,23 @@ class FailureMiner:
     def mine(self, observations: Iterable[dict[str, Any]]) -> list[CandidateCase]:
         """从观测记录里挖候选。
 
-        ``observations`` 的字段取自既有评测/运行时输出：
-        ``question / outcome / answer / grounding.support_rate / evidence 数 / error``。
+        ``observations`` 接受**观测日志的原样记录**（``CaseObservation.to_dict()``），
+        字段名通过 :func:`_field` 做多键兼容——见它上面的说明，
+        这里曾经因为键名不一致而静默挖出 0 条。
         """
 
         found: list[CandidateCase] = []
         seen: set[str] = set()
         for item in observations:
             self.stats.scanned += 1
-            question = str(item.get("question") or "").strip()
+            question = str(_field(item, "question", default="") or "").strip()
             if not question:
                 continue
             reason = self._classify(item)
             if reason is None:
                 continue
             if self.require_retrieval and reason is FailureReason.EMPTY_EVIDENCE:
+                self.stats.skipped_no_retrieval += 1
                 continue
             identifier = candidate_id(question)
             if identifier in seen:
@@ -151,11 +193,13 @@ class FailureMiner:
                     case_id=identifier,
                     question=question,
                     reason=reason,
-                    outcome=str(item.get("outcome") or ""),
-                    answer=str(item.get("answer") or ""),
-                    support_rate=float(item.get("support_rate") or 0.0),
-                    retrieved=int(item.get("retrieved") or 0),
-                    notes=str(item.get("notes") or ""),
+                    outcome=str(_field(item, "outcome", default="") or ""),
+                    answer=str(_field(item, "answer", default="") or ""),
+                    support_rate=float(_field(item, "answer_support_rate", "support_rate", default=0.0) or 0.0),
+                    retrieved=_as_count(
+                        _field(item, "retrieved", "retrieved_sources", "retrieved_chunk_ids")
+                    ),
+                    notes=str(_field(item, "notes", default="") or ""),
                 )
             )
             self.stats.mined += 1
@@ -163,19 +207,36 @@ class FailureMiner:
         return found
 
     def _classify(self, item: dict[str, Any]) -> FailureReason | None:
-        if item.get("error"):
+        """判定这条观测"为什么值得进候选池"。
+
+        判据顺序与理由（每一步的顺序都不是随意的）：
+
+        1. **真正的运行异常**：只看 ``failed`` 与显式的 ``error`` 字段。
+           **刻意不看 ``error_code``**——在本项目里 error_code 是"类型化结果"的标识，
+           拒答（``insufficient_evidence``）本身就带 error_code。
+           把它当异常信号，会让**所有拒答都被误判成崩溃**，而报告上看起来一切正常。
+        2. 用户点踩：最强信号，优先于所有结构性判断。
+        3. 检索为空：数据覆盖问题，默认不进"系统能力"评测集。
+        4. 重生成过 / 支撑率低 / 拒答：按从强到弱排列。
+
+        ``support_rate`` 为 0 时**不判低支撑**：拒答样本没有答案可校验，
+        0 在这里的含义是"不适用"而不是"零支撑"。把两者混同会把拒答误报成幻觉。
+        """
+
+        if _field(item, "failed") is True or _field(item, "error"):
             return FailureReason.ERROR
-        if item.get("user_feedback") == "negative":
+        if _field(item, "user_feedback") == "negative":
             return FailureReason.USER_NEGATIVE
-        retrieved = int(item.get("retrieved") or 0)
+        retrieved = _as_count(_field(item, "retrieved", "retrieved_sources", "retrieved_chunk_ids"))
         if retrieved == 0:
             return FailureReason.EMPTY_EVIDENCE
-        if int(item.get("regenerations") or 0) > 0:
+        if _as_count(_field(item, "regenerations")) > 0:
             return FailureReason.REGENERATED
-        support = float(item.get("support_rate") or 0.0)
+        support = float(_field(item, "answer_support_rate", "support_rate", default=0.0) or 0.0)
         if support and support < self.support_floor:
             return FailureReason.LOW_SUPPORT
-        if str(item.get("outcome") or "") in {"insufficient_evidence", "no_knowledge", "clarify"}:
+        outcome = str(_field(item, "outcome", default="") or "")
+        if outcome in {"insufficient_evidence", "no_knowledge", "clarify"}:
             return FailureReason.ABSTAINED
         return None
 

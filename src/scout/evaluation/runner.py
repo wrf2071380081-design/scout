@@ -83,6 +83,15 @@ class RunConfig:
     label: str = ""
     k_values: tuple[int, ...] = DEFAULT_K_VALUES
     limit: int | None = None
+    skip: int = 0
+    """跳过前 N 条样本。
+
+    它的用途不是"少跑一点"，而是**跑评测集之外的那一部分**：
+    数据飞轮要挖的是"还没进评测集"的问题，
+    而扩展集（v2 = v1 + 新增）的前 N 条恰好就是 v1，
+    不跳过就永远挖不到增量——这个坑很隐蔽，结果看起来像"飞轮没用"。
+    """
+
     repeat: int = 1
 
     def effective_label(self) -> str:
@@ -285,6 +294,8 @@ def run_evaluation(
     pipeline = RAGPipeline(active_index, client, settings=effective, config=config.pipeline_config)
 
     cases = list(dataset.cases)
+    if config.skip:
+        cases = cases[config.skip :]
     if config.limit is not None:
         cases = cases[: config.limit]
 
