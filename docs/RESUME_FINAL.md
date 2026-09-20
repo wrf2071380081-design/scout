@@ -25,13 +25,15 @@
   内容哈希 + SimHash 两段去重；检索侧混合召回（稠密 + BM25 + RRF）接 cross-encoder 重排，
   候选池有界截断（top_k × 4）以控制长尾延迟。
 
-- **检索核心杠杆被量化**：同一批样本、同一份语料，仅替换重排器
-  （词法重排 → cross-encoder `bge-reranker`），**端到端作答率 7% → 24%、
-  Recall@5 26.7% → 48.0%**——用消融证明"十七个百分点的结构改动"优于"三个百分点的调参"。
+- **可消融架构，改动优先级可排序**：每个模块独立开关、同语料消融，把"该先改哪里"
+  变成排好序的数字——**混合检索 −41.9pp MRR（最大杠杆）> 重排 −16.2pp >
+  查询改写 −1.1pp（近乎无效）**；公开基准上仅替换重排器（词法 → cross-encoder）
+  即让 **Recall@5 26.7% → 48.0%**；并如实报出反直觉结论：
+  父块合并的 REPLACE 策略反胜 EXPAND **+6.8pp MRR**。
 
-- **拒答可校准，不是全局保守**：幻觉率与误拒率分列管理（不合并成一个"拒答率"）；
-  同一套门控在**中文长文档上误拒率 0%、作答率 68.4%**，在**英文多跳上作答率 24%**——
-  拒答率随语料与语言匹配度变化，且两组都做到**零编造**。
+- **拒答可校准**：幻觉率与误拒率分列管理（不合并成一个"拒答率"）；
+  拒答阈值按语料校准——**中文长文档误拒率 0%、作答率 68.4%**，
+  **英文多跳作答率 24%**，两组均**零编造**。
 
 - **可恢复的 Agent 运行时**：统一三种状态后端（Memory / JSONL / **Redis**）；
   HITL 风险分级审批与审批中动态改参；**副作用按调用槽位血缘幂等，断点恢复不重放**；
@@ -56,6 +58,8 @@
 | **Recall@5 48.0%（CI [39.0, 57.0]）/ Recall@10 53.0%** | MuSiQue-Ans 前 50 条冻结样本、1000 段联合检索池、真实 LLM + 语义向量 + cross-encoder | `evals/results/musique_bench_realllm.md` |
 | **作答率 24%、零编造** | 同上；其余 76% 为门控明确拒答 | 同上 |
 | **7% → 24% / 26.7% → 48.0%** | 同一批样本，唯一变量＝重排器（词法 → cross-encoder） | `evals/results/musique_bench_realllm_2cfg.md` |
+| **混合检索 −41.9pp MRR / 重排 −16.2pp / 改写 −1.1pp** | 长文档语料消融，19 条样本、**离线替身模型**——只用作"优先级排序"的依据，不要当统计结论报 | `evals/results/ablation.md` |
+| **REPLACE 反胜 EXPAND +6.8pp MRR** | 同上（与主流直觉相反的负向结论） | 同上 |
 | **挡下 115 个重复片段（13%）** | 886 个切分段：精确去重 86 + SimHash 近似去重 29 | `scout ingest` |
 | **2 篇双栏重排 660 行** | 版面还原在真实语料上的实际生效量 | 同上 |
 | **8/8、100%、0** | 8 类注入故障：类型化捕获 8/8、预算内恢复 100%、裸异常 0 | `evals/results/fault_injection.md` |
@@ -77,12 +81,15 @@ evaluation suite that makes every module measurable, toggleable, and revertible.
 - **Data layer & retrieval pipeline**: dual-column layout restoration, cross-page table header
   repair, exact-hash + SimHash two-stage dedup; hybrid recall (dense + BM25 + RRF) feeding a
   cross-encoder reranker with a bounded candidate pool (top_k × 4).
-- **Quantified the biggest lever in retrieval**: on identical samples, replacing the lexical
-  reranker with a cross-encoder raised the end-to-end answer rate from **7% to 24%** and
-  Recall@5 from 26.7% to 48.0% — structural change beats threshold tuning.
-- **Calibrated abstention, not blanket conservatism**: hallucination and false-refusal tracked
-  separately; the same gate achieves **0% false refusal / 68.4% answer rate on Chinese long
-  documents** versus **24% answer rate on English multi-hop** — both with **zero fabrication**.
+- **Ablatable architecture with a ranked change-priority**: each module can be toggled
+  independently; same-corpus ablation turns "what should we improve first" into an ordered
+  number — **hybrid retrieval −41.9pp MRR (the biggest lever) > reranking −16.2pp >
+  query rewriting −1.1pp (negligible)**. On the public benchmark, swapping only the reranker
+  (lexical → cross-encoder) raised **Recall@5 from 26.7% to 48.0%**; we also report a
+  counter-intuitive finding: the REPLACE merge strategy **beats EXPAND by +6.8pp MRR**.
+- **Calibrated abstention**: hallucination and false-refusal tracked as separate metrics;
+  the threshold is calibrated per corpus — **0% false refusal / 68.4% answer rate on Chinese
+  long documents**, **24% answer rate on English multi-hop** — both with **zero fabrication**.
 - **Durable agent runtime**: three swappable checkpoint backends (Memory / JSONL / **Redis**),
   risk-tiered HITL approval with in-flight parameter editing, **idempotent side effects keyed by
   calling-slot lineage** (no replay on resume), step-level time travel, fail-closed timeout.
@@ -183,6 +190,80 @@ MuSiQue 是用来测**多跳推理与防幻觉拒答**的，两套基准覆盖�
 不重建图。状态是 snapshot，审批改参只更新当前 checkpoint 的 `pending_step.pending_args`，
 然后**从那次调用继续**（不是跳到下一步、也不是让模型重跑一次）——
 这个 `pending_step` 字段的缺失是自研 HITL 最隐蔽的 bug。
+
+---
+
+### 9. 「MuSiQue 为什么只测 50 条？CI 跨度 18pp 是不是样本太少」
+
+> ⚠️ **外部建议答"50 条是经过 Stratified Sampling 抽样的冻结测试集"——这是编的。**
+> 实际实现是按顺序取**前 50 条含支撑段落的样本**（`if len(samples) >= SAMPLE_LIMIT: break`），
+> **没有做分层抽样**。面试官追问一句"怎么分层的？各层多少条？"就穿了。
+
+**真实答法**：
+
+> 「50 条是**冻结 dev 集的前 50 条**（按顺序取，不做筛选），不是分层抽样——
+> 分层抽样会让样本量看起来更合理，但那个说法我站不住，所以我不用。
+>
+> 只跑 50 条纯粹是成本：端到端每条要走真实 LLM + cross-encoder 逐级重排，
+> 单条约 25–60 秒，全量 300 条要一小时以上，而且我的机器没有 GPU。
+>
+> **Bootstrap 95% CI 的作用恰恰是把这个局限量化出来**，而不是掩盖它：
+> [39.0, 57.0] 这 18 个百分点的跨度就是"50 条样本能支撑的结论强度"。
+> 想把它收紧到 ±5pp，样本量大约要到 300 条，这是下一步要做的。」
+
+**为什么这个答法比"分层抽样"强**：它同时展示了三件事——知道自己的评测成本、
+知道 CI 的统计含义、知道下一步要多少样本。而编一个抽样方法，只需要一个问题就崩。
+
+### 10. 「top_k × 4 的截断阈值怎么定的？会不会就是它导致 Recall@10 只有 53%」
+
+> ⚠️ **外部建议答"经过延迟敏感度压测得出的折中点……扩到 top_k × 10 延迟升 2.5x
+> 但 Recall@10 仅提升 3.2%"——这两个数字都是编的，我们从没跑过那个实验。**
+> 更严重的是**因果也错了**（见下）。
+
+**真实答法（先说因果）**：
+
+> 「先纠正一个因果：**重排的截断不会限制 Recall@10**。
+> 检索每路只取 `top_k × 2 = 16` 条，而重排的候选上限是 `top_k × 4 = 32` 条——
+> **上限比实际取到的还多，所以那个截断从来没有生效过**。
+> 真正的约束是检索层的取法（每路 16 条）。
+>
+> `top_k × 4` 是**设计选择而不是扫参结果**：cross-encoder 是 O(n) 的，
+> 候选数直接决定延迟，所以设了上限防止候选池被撑大；因为单路只取 16 条，
+> 这个上限目前是安全余量而不是紧约束。」
+
+**53% 的真实原因**（与第 5 条同源，两个原因叠加）：
+
+1. **单路检索取 16 条，而多跳题需要跨 2+ 篇文档的证据** —— 一个 query 很难同时取全；
+   解法是子问题分解 + 多路召回合并，而不是把 k 调大。
+2. **语料语言与向量模型错配**（英文语料 + 中文专用 `bge-small-zh`），
+   实测换中文语义模型后纯稠密通道 9.7% → **6.8%**（不升反降）。
+
+### 11. 「SimHash 挡下 13% 的重复片段，删的是什么？有没有误杀风险」
+
+> ⚠️ **外部建议答"页眉页脚、版权声明、目录重复索引"——方向沾边，但主因说错了。**
+> 我实际把 115 条被删的片段全捞出来看过，真实构成是：
+
+**真实答法（实测数据）**：
+
+> 「**主因是交易所强制模板导致的小节标题跨公司重复**，不是页眉页脚。
+> 20 份年报摘要用的是同一套格式，`## 第二节 公司基本情况` 在 **12 份文档里一字不差**，
+> `## 3、公司主要会计数据和财务指标` 出现 7 次、`## 1、公司简介` 出现 6 次。
+> 86 条精确重复里 **69 条是纯标题块**、全部短于 60 字。
+>
+> **为什么必须删**：这类块是纯噪声——任何"某公司基本情况"的查询都会命中它，
+> 但它不携带任何区分信息，还会把重排的候选池占满。删掉它，
+> 等于**把重排预算还给了真正有区分度的段落**。
+>
+> 少数是模板正文（约 6 条），比如年报"重要提示"里的标准声明、
+> '股票简况'表格的重复模板——这部分才是外部说的'免责声明'类，但它只占少数。
+>
+> **误杀风险**：我用的判据是内容哈希（零误判）+ SimHash 汉明距离 ≤ 3 位（64 位指纹）。
+> 实测近重复样例的距离分布集中在 0–2 位，而不同主题的段落距离远大于 3，**没有出现误杀。
+> 保守起见阈值仍设为 3，宁可漏删也不误删——去重过头会直接损失信息，比多留一点贵得多。**」
+
+**顺带一个诚实的副产品**：那 69 条纯标题块暴露了一个真实的小问题——
+切分器会在标题后没有正文时产出"只有标题"的块。它们没有检索价值，
+本应在切分阶段就丢掉，而不是靠去重兜住。这是下一步要修的。
 
 ---
 
