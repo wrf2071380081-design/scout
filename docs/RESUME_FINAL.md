@@ -25,15 +25,13 @@
   内容哈希 + SimHash 两段去重；检索侧混合召回（稠密 + BM25 + RRF）接 cross-encoder 重排，
   候选池有界截断（top_k × 4）以控制长尾延迟。
 
-- **可消融架构，改动优先级可排序**：每个模块独立开关、同语料消融，把"该先改哪里"
-  变成排好序的数字——**混合检索 −41.9pp MRR（最大杠杆）> 重排 −16.2pp >
-  查询改写 −1.1pp（近乎无效）**；公开基准上仅替换重排器（词法 → cross-encoder）
-  即让 **Recall@5 26.7% → 48.0%**；并如实报出反直觉结论：
-  父块合并的 REPLACE 策略反胜 EXPAND **+6.8pp MRR**。
+- **模块级消融与优先级排序**：全模块可独立开关，同语料消融得出边际贡献——
+  **混合检索 −41.9pp MRR > 重排 −16.2pp > 查询改写 −1.1pp**；
+  父块合并 REPLACE 策略 **+6.8pp MRR**；公开基准替换重排器
+  （词法 → cross-encoder）**Recall@5 26.7% → 48.0%**。
 
-- **拒答可校准**：幻觉率与误拒率分列管理（不合并成一个"拒答率"）；
-  拒答阈值按语料校准——**中文长文档误拒率 0%、作答率 68.4%**，
-  **英文多跳作答率 24%**，两组均**零编造**。
+- **拒答可校准**：幻觉率与误拒率分列计量；阈值按语料校准——
+  中文长文档**误拒率 0%、作答率 68.4%**，英文多跳**作答率 24%**，均**零编造**。
 
 - **可恢复的 Agent 运行时**：统一三种状态后端（Memory / JSONL / **Redis**）；
   HITL 风险分级审批与审批中动态改参；**副作用按调用槽位血缘幂等，断点恢复不重放**；
@@ -81,15 +79,13 @@ evaluation suite that makes every module measurable, toggleable, and revertible.
 - **Data layer & retrieval pipeline**: dual-column layout restoration, cross-page table header
   repair, exact-hash + SimHash two-stage dedup; hybrid recall (dense + BM25 + RRF) feeding a
   cross-encoder reranker with a bounded candidate pool (top_k × 4).
-- **Ablatable architecture with a ranked change-priority**: each module can be toggled
-  independently; same-corpus ablation turns "what should we improve first" into an ordered
-  number — **hybrid retrieval −41.9pp MRR (the biggest lever) > reranking −16.2pp >
-  query rewriting −1.1pp (negligible)**. On the public benchmark, swapping only the reranker
-  (lexical → cross-encoder) raised **Recall@5 from 26.7% to 48.0%**; we also report a
-  counter-intuitive finding: the REPLACE merge strategy **beats EXPAND by +6.8pp MRR**.
-- **Calibrated abstention**: hallucination and false-refusal tracked as separate metrics;
-  the threshold is calibrated per corpus — **0% false refusal / 68.4% answer rate on Chinese
-  long documents**, **24% answer rate on English multi-hop** — both with **zero fabrication**.
+- **Module-level ablation & change-priority**: every module independently toggleable;
+  same-corpus ablation yields marginal contributions — **hybrid retrieval −41.9pp MRR >
+  reranking −16.2pp > query rewriting −1.1pp**; REPLACE merge **+6.8pp MRR**; on the public
+  benchmark a reranker swap (lexical → cross-encoder) gives **Recall@5 26.7% → 48.0%**.
+- **Calibrated abstention**: hallucination and false-refusal metered separately; thresholds
+  calibrated per corpus — Chinese long documents **0% false refusal / 68.4% answer rate**,
+  English multi-hop **24% answer rate**, both with **zero fabrication**.
 - **Durable agent runtime**: three swappable checkpoint backends (Memory / JSONL / **Redis**),
   risk-tiered HITL approval with in-flight parameter editing, **idempotent side effects keyed by
   calling-slot lineage** (no replay on resume), step-level time travel, fail-closed timeout.
