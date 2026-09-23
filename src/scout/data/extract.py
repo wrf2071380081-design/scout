@@ -894,6 +894,8 @@ class StubTextExtractor:
 DEFAULT_OCR_PROMPT = (
     "请把这张图片中的全部文字逐字提取出来，保持原有的阅读顺序。\n"
     "表格请输出为 HTML 表格（<table>），保留表头与单元格对应关系。\n"
+    "**表头必须逐字照抄，保持原语言，不要翻译、不要改写、不要用同义词替换**；\n"
+    "表格的第一行如果是表头，就不要把它当数据行。\n"
     "只输出内容本身，不要任何解释、总结、前后缀，也不要重复输出。"
 )
 
@@ -974,6 +976,38 @@ def build_extractor(
     if allow_stub:
         return StubTextExtractor(default="")
     return None
+
+
+def build_extractor_from_settings(settings: Any) -> TextExtractor | None:
+    """从全局配置构造图片抽取器。
+
+    **为什么要有这个共享工厂。** 图片抽取器本来只在 ``ingest --images`` 里构造，
+    结果语料加载路径（``load_corpus``）只认 ``.md/.txt``——
+    把一张扫描件丢进语料目录跑 ``scout serve`` 或 ``eval run``，
+    图片是**被静默跳过**的：检索里什么都没有，而报表上看不出任何异常。
+
+    现在有 5 处调用语料加载（eval run / eval ablation / ingest / serve / MCP），
+    各自手工构造抽取器必然漂移。统一从这里拿，保证"哪些文件能被读进来"
+    在**所有入口**上一致。
+    """
+
+    vision = getattr(settings, "vision", None)
+    llm = getattr(settings, "llm", None)
+    if vision is None:
+        return None
+    return build_extractor(
+        vision_enabled=bool(getattr(vision, "enabled", False)),
+        provider=str(getattr(vision, "provider", "vlm") or "vlm"),
+        model=str(getattr(vision, "model", "") or ""),
+        base_url=str(getattr(vision, "base_url", "") or getattr(llm, "base_url", "") or ""),
+        api_key=str(getattr(vision, "api_key", "") or getattr(llm, "api_key", "") or ""),
+        prompt=str(getattr(vision, "prompt", "") or ""),
+        max_tokens=int(getattr(vision, "max_tokens", 16384) or 16384),
+        max_image_side=int(getattr(vision, "max_image_side", 0) or 0),
+        glm_base_url=str(getattr(vision, "glm_base_url", "https://open.bigmodel.cn")),
+        glm_api_key=str(getattr(vision, "glm_api_key", "") or ""),
+        glm_model=str(getattr(vision, "glm_model", "glm-ocr") or "glm-ocr"),
+    )
 
 
 def extract_document(

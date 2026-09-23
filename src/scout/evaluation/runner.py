@@ -47,25 +47,76 @@ from .metrics import (
     tag_slices,
 )
 
+# 图片后缀从 data 层引入，避免两处各写一份（迟早漂移）
+from ..data.extract import IMAGE_SUFFIXES  # noqa: E402
+
 SUPPORTED_SUFFIXES = (".md", ".txt")
 
 
-def load_corpus(directory: str | Path, *, max_files: int | None = None) -> list[tuple[str, str]]:
-    """从目录读取语料。返回 ``[(filename, text), ...]``，按文件名排序保证确定性。"""
+def load_corpus(
+    directory: str | Path,
+    *,
+    max_files: int | None = None,
+    image_extractor: Any = None,
+    skip_log: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """从目录读取语料。返回 ``[(filename, text), ...]``，按文件名排序保证确定性。
+
+    :param image_extractor: 图片抽取器（见 :func:`scout.data.build_extractor_from_settings`）。
+        给了就把图片走抽取后并入同一条链路；**不给则把图片记进 ``skip_log``，
+        而不是静默跳过**。
+
+    **为什么"静默跳过"必须被消灭。**
+    这个函数是语料的唯一入口，被 5 处调用（eval run / eval ablation /
+    ingest / serve / MCP）。旧实现只认 ``.md/.txt``，其余一律 ``continue``——
+    于是把扫描件放进语料目录跑 ``scout serve``，结果是
+    **文档数不变、检索里什么都没有、报表上没有任何异常**。
+    使用者只会觉得"怎么搜不到"，而不知道是文件格式被过滤了。
+
+    所以现在所有被跳过的文件都进 ``skip_log``（含原因），由调用方决定怎么提示。
+    """
 
     root = Path(directory)
     if not root.exists():
         raise FileNotFoundError(f"语料目录不存在：{root}")
     documents: list[tuple[str, str]] = []
     for path in sorted(root.iterdir()):
-        if path.suffix.lower() not in SUPPORTED_SUFFIXES or not path.is_file():
+        if not path.is_file():
             continue
         # 语料目录里通常会放一份 README 说明来源，它不是待检索的文档。
         if path.stem.lower() in {"readme", "index", "说明"}:
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if not text.strip():
+
+        suffix = path.suffix.lower()
+        if suffix in SUPPORTED_SUFFIXES:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if not text.strip():
+                if skip_log is not None:
+                    skip_log.append(f"{path.name}: 内容为空")
+                continue
+        elif suffix in IMAGE_SUFFIXES:
+            if image_extractor is None:
+                if skip_log is not None:
+                    skip_log.append(
+                        f"{path.name}: 图片但未配置抽取器（设 SCOUT_VISION_ENABLED=1 与模型）"
+                    )
+                continue
+            try:
+                extracted = image_extractor.extract(path)
+            except Exception as exc:  # noqa: BLE001 - 单篇失败不应中断整批
+                if skip_log is not None:
+                    skip_log.append(f"{path.name}: 抽取失败 {type(exc).__name__}: {str(exc)[:120]}")
+                continue
+            text = extracted.text
+            if not text.strip():
+                if skip_log is not None:
+                    skip_log.append(f"{path.name}: 抽取结果为空")
+                continue
+        else:
+            if skip_log is not None:
+                skip_log.append(f"{path.name}: 不支持的格式 {suffix or '(无后缀)'}")
             continue
+
         documents.append((path.name, text))
         if max_files is not None and len(documents) >= max_files:
             break

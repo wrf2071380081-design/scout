@@ -169,7 +169,21 @@ def run_mcp(corpus_dir: str | Path, settings: Settings | None = None) -> None:
 
     effective = settings or get_settings()
     path = Path(corpus_dir)
-    documents = load_corpus(path) if path.exists() else []
+    # 图片同样可入：语料加载统一走抽取入口（抽不到会记进 skipped 而非静默跳过）
+    from ..data import build_extractor_from_settings
+
+    skipped: list[str] = []
+    documents = (
+        load_corpus(
+            path,
+            image_extractor=build_extractor_from_settings(effective),
+            skip_log=skipped,
+        )
+        if path.exists()
+        else []
+    )
+    for item in skipped:
+        print(f"[scout-mcp] 跳过：{item}", file=sys.stderr)
     if not documents:
         documents = [("README.md", "空语料：请用 --corpus 指定文档目录。")]
     pipeline = RAGPipeline(build_index(documents, settings=effective), default_client(), settings=effective)

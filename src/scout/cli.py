@@ -131,7 +131,7 @@ def cmd_eval_validate(args: argparse.Namespace) -> int:
 
 def cmd_eval_run(args: argparse.Namespace) -> int:
     dataset = load_dataset(args.dataset)
-    documents = load_corpus(args.corpus, max_files=args.max_files)
+    documents = _load_corpus_with_images(args.corpus, max_files=args.max_files)
     if not documents:
         print(f"语料目录为空：{args.corpus}", file=sys.stderr)
         return 2
@@ -180,9 +180,59 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_corpus_with_images(
+    directory: str | Path,
+    *,
+    max_files: int | None = None,
+    quiet: bool = False,
+) -> list[tuple[str, str]]:
+    """统一的语料加载入口：**文本直读，图片走抽取**，并如实报告被跳过的文件。
+
+    语料只有这一个入口，所有命令（eval / ingest / serve / MCP）都从这里拿文档，
+    这样"哪些文件能被读进来"在所有入口上保持一致。
+    抽不到就明确报告——旧实现静默 `continue`，
+    表现是"把扫描件放进目录后检索里什么都没有，而报表毫无异常"。
+    """
+
+    from .data import build_extractor_from_settings
+
+    settings = get_settings()
+    extractor = build_extractor_from_settings(settings)
+    skips: list[str] = []
+    documents = load_corpus(
+        directory,
+        max_files=max_files,
+        image_extractor=extractor,
+        skip_log=skips,
+    )
+    if skips and not quiet:
+        print(f"⚠️  跳过 {len(skips)} 个文件：", file=sys.stderr)
+        for item in skips[:8]:
+            print(f"    - {item}", file=sys.stderr)
+        if len(skips) > 8:
+            print(f"    …（共 {len(skips)} 条）", file=sys.stderr)
+        print(
+            "    提示：图片需要在语料目录里被抽取才能入库——"
+            "set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>"
+            "（本地零成本路线：SCOUT_OCR_PROVIDER=ollama）",
+            file=sys.stderr,
+        )
+    if extractor is not None:
+        usage_report = getattr(extractor, "usage_report", None)
+        if callable(usage_report) and not quiet:
+            usage = usage_report()
+            if usage.get("calls"):
+                print(
+                    f"图片抽取：{usage['calls']} 张，共 {usage['total_tokens']} token"
+                    f"（prompt {usage['prompt_tokens']} + completion {usage['completion_tokens']}）",
+                    file=sys.stderr,
+                )
+    return documents
+
+
 def cmd_eval_ablation(args: argparse.Namespace) -> int:
     dataset = load_dataset(args.dataset)
-    documents = load_corpus(args.corpus, max_files=args.max_files)
+    documents = _load_corpus_with_images(args.corpus, max_files=args.max_files)
     if not documents:
         print(f"语料目录为空：{args.corpus}", file=sys.stderr)
         return 2
@@ -440,7 +490,9 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 )
         print()
     else:
-        documents = load_corpus(directory, max_files=args.limit or None)
+        # 非 --images 路径也走统一入口：目录里若有图片，会明确报告被跳过，
+        # 而不是静默忽略（静默忽略正是"我放了文件但它没进库"的根源）
+        documents = _load_corpus_with_images(directory, max_files=args.limit or None)
 
     sections, report, registry = ingest(documents)
 

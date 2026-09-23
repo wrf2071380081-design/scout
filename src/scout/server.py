@@ -93,10 +93,20 @@ class ConsoleApp:
     ) -> None:
         self.settings = settings or get_settings()
         self.documents: list[tuple[str, str]] = []
+        self.skipped_files: list[str] = []
         if corpus_dir:
             path = Path(corpus_dir)
             if path.exists():
-                self.documents = load_corpus(path)
+                # 图片也要能进库：语料加载统一走抽取入口，
+                # 抽不到的记进 skipped_files 并在启动时提示（不静默忽略）
+                from .data import build_extractor_from_settings
+                from .evaluation.runner import load_corpus
+
+                self.documents = load_corpus(
+                    path,
+                    image_extractor=build_extractor_from_settings(self.settings),
+                    skip_log=self.skipped_files,
+                )
         if not self.documents:
             self.documents = list(_FALLBACK_CORPUS)
         self.index = build_index(self.documents, settings=self.settings, embed_backend=embed_backend)

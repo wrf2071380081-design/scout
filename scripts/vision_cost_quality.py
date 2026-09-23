@@ -31,8 +31,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from scout.config import get_settings  # noqa: E402
 from scout.data.extract import OllamaOCRExtractor, VLMTextExtractor  # noqa: E402
 
-# ground truth：Docker 截图里应当被抽出来的关键事实
+# ground truth 关键事实。
+#
+# ⚠️ **这里曾经有个盲区，值得记住。**
+# 最初只列了"单元格里的值"（容器名 / 镜像名 / 端口），于是两个模型都是 18/18——
+# 但实际上本地模型的**表头是臆造的**（把 Name/Container ID/Image/Port(s)
+# 写成了"仓库/项目/版本/状态"，还把第一行数据混进去）。
+#
+# 表头不是装饰：它是**检索与门控的语义锚点**。
+# 问"端口映射是什么"要靠 "Port(s)" 这个字面锚点才能匹配上，
+# 表头错了就会：检索能召回 → 但覆盖度不足 → 拒答。
+# 所以表头必须进 ground truth，否则指标会系统性地高估抽取质量。
 KEY_FACTS = [
+    # —— 表头（原图为英文，必须逐字保留）——
+    "Port(s)",
+    "Container ID",
+    "Image",
+    "CPU %",
+    "Last started",
     "supermew",
     "milvus-attu",
     "milvus-standalone",

@@ -28,6 +28,7 @@ from .extract import (
     StubTextExtractor,
     VLMTextExtractor,
     build_extractor,
+    build_extractor_from_settings,
     extract_document,
     load_documents_with_extraction,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "VLMTextExtractor",
     "VersionRegistry",
     "build_extractor",
+    "build_extractor_from_settings",
     "content_hash",
     "deduplicate",
     "detect_columns",
