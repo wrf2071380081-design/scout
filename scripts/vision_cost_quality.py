@@ -56,11 +56,21 @@ KEY_FACTS = [
 
 @dataclass(slots=True)
 class Arm:
-    """一个实验臂（一组参数）。"""
+    """一个实验臂（一组参数）。
+
+    每个臂自带 ``base_url`` / ``model`` / ``provider``——
+    因为本实验的核心是**横向比较不同工具**：云端通用推理 VLM 与本地专用 OCR
+    根本不是同一个东西（成本模型、延迟、质量都不同），
+    共用一个网关配置会让对照失去意义。
+    """
 
     name: str
     max_image_side: int
     max_tokens: int
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
+    provider: str = "vlm"
     text: str = ""
     error: str = ""
     duration_ms: float = 0.0
@@ -90,23 +100,29 @@ class Arm:
         }
 
 
+def base_url_model(arm: "Arm", settings: object) -> tuple[str, str]:
+    """臂未指定时回落到全局配置。"""
+
+    base = arm.base_url or settings.vision.base_url or settings.llm.base_url
+    model = arm.model or settings.vision.model
+    return base, model
+
+
 def run_arm(
     image: Path,
     *,
-    name: str,
-    max_image_side: int,
-    max_tokens: int,
+    arm: Arm,
     settings: object,
 ) -> Arm:
-    arm = Arm(name=name, max_image_side=max_image_side, max_tokens=max_tokens)
+    base, model = base_url_model(arm, settings)
     extractor = VLMTextExtractor(
-        model=settings.vision.model,
-        base_url=settings.vision.base_url or settings.llm.base_url,
-        api_key=settings.vision.api_key or settings.llm.api_key,
+        model=model,
+        base_url=base,
+        api_key=arm.api_key or settings.vision.api_key or settings.llm.api_key,
         prompt=settings.vision.prompt,
-        max_tokens=max_tokens,
-        max_image_side=max_image_side,
-        timeout=600.0,
+        max_tokens=arm.max_tokens,
+        max_image_side=arm.max_image_side,
+        timeout=900.0,  # 本地 CPU 推理可能很慢
     )
     # 直接调 _post 拿原始响应，才能统计 reasoning token——
     # 这是本实验的核心指标之一，走 extract() 会丢掉它。
@@ -163,14 +179,12 @@ def main() -> int:
 
     results: list[dict[str, object]] = []
     for arm in arms:
-        print(f"跑 {arm.name} …（max_tokens={arm.max_tokens}，降采样={arm.max_image_side or '关'}）")
-        done = run_arm(
-            image,
-            name=arm.name,
-            max_image_side=arm.max_image_side,
-            max_tokens=arm.max_tokens,
-            settings=settings,
+        print(
+            f"跑 {arm.name} …（模型 {base_url_model(arm, settings)[1]}"
+            f" @ {base_url_model(arm, settings)[0]}，max_tokens={arm.max_tokens}，"
+            f"降采样={arm.max_image_side or '关'}）"
         )
+        done = run_arm(image, arm=arm, settings=settings)
         results.append(done.to_dict())
         print(
             f"  → 事实命中 {len(done.hits)}/{len(KEY_FACTS)}｜"
