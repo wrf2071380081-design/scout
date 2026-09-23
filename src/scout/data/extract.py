@@ -822,6 +822,36 @@ class OllamaOCRExtractor:
         kept = lines[:cursor]
         return "\n".join(kept).rstrip(), run
 
+    @staticmethod
+    def restore_stop_suffix(text: str, stop_sequences: Sequence[str], done_reason: str) -> str:
+        """把被 stop 序列「吃掉」的结尾补回来。
+
+        Ollama 命中 stop 序列时会**把它从输出里去掉**。对 ``</table>`` 这种闭合标签，
+        结果就是表格内容完整、但 HTML 不闭合（结尾停在 ``</tbody>``）——
+        下游若按 HTML 解析会失败，或把后续内容误并进来。
+
+        **判据是「结构未闭合」，不是「字符串没出现过」**：
+        统计 ``<table`` 与 ``</table>`` 的出现次数，前者多才补——
+        这样对"文档里本来就没有表格"的情况不会凭空加标签。
+        最初写成 ``sequence in text`` 是错的（那正是被移除的串，恒为假），
+        靠跑一次才看出来。
+        """
+
+        if done_reason != "stop" or not stop_sequences:
+            return text
+        stripped = text.rstrip()
+        lowered = stripped.lower()
+        for sequence in stop_sequences:
+            if not sequence:
+                continue
+            marker = sequence.strip().lower()
+            if not marker.startswith("</") or not marker.endswith(">"):
+                continue
+            tag = marker[2:-1]
+            if lowered.count(f"<{tag}") > lowered.count(marker):
+                return stripped + sequence
+        return text
+
     def extract(self, path: Path) -> ExtractedText:
         started = time.perf_counter()
         payload = self.build_payload(path)
@@ -831,12 +861,17 @@ class OllamaOCRExtractor:
         self.usage["completion_tokens"] += int(data.get("eval_count") or 0)
         self.usage["total_tokens"] = self.usage["prompt_tokens"] + self.usage["completion_tokens"]
         text = self.parse_response(data)
+        text = self.restore_stop_suffix(
+            text, self.stop_sequences, str(data.get("done_reason") or "")
+        )
 
         warnings: list[str] = []
-        if str(data.get("done_reason") or "") == "length":
+        done_reason = str(data.get("done_reason") or "")
+        if done_reason == "length":
             warnings.append(
                 f"输出撞上 num_predict={self.num_predict}——本地模型在不知道该何时停时"
                 "会一路写满，已尝试裁剪尾部退化"
+                "（配了 stop 序列可避免，见 stop_sequences 的取舍说明）"
             )
         trimmed_text, removed = self.trim_degenerate_tail(text, min_repeat=self.min_repeat_tail)
         if removed:
@@ -955,7 +990,7 @@ def build_extractor(
         return OllamaOCRExtractor(
             model=model or "glm-ocr",
             host=base_url or "http://127.0.0.1:11434",
-            stop_sequences=list(stop_sequences or []) if hasattr(stop_sequences, "__iter__") else None,
+            stop_sequences=list(stop_sequences or []),
         )
     if vision_enabled and provider == "glm-ocr":
         # 专用文档解析模型：不走 chat/completions，走 /layout_parsing。
@@ -1007,6 +1042,7 @@ def build_extractor_from_settings(settings: Any) -> TextExtractor | None:
         glm_base_url=str(getattr(vision, "glm_base_url", "https://open.bigmodel.cn")),
         glm_api_key=str(getattr(vision, "glm_api_key", "") or ""),
         glm_model=str(getattr(vision, "glm_model", "glm-ocr") or "glm-ocr"),
+        stop_sequences=list(getattr(vision, "stop_sequences", ()) or ()),
     )
 
 

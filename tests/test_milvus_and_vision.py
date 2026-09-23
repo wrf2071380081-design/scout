@@ -309,6 +309,48 @@ def test_glm_ocr_end_to_end_with_injected_poster(tmp_path: Path) -> None:
     assert extractor.usage_report()["total_tokens"] == 120
 
 
+def test_ollama_stop_sequence_restores_closing_tag() -> None:
+    """stop 序列会被 Ollama「吃掉」，闭合标签要补回来。
+
+    实测：配 ``stop=["</table>"]`` 后模型**自己停了**（不再写满上限），
+    耗时从 ~22s 降到 ~4s、生成量从 4096 token 降到 688——**快 5 倍**。
+    但 Ollama 命中 stop 时会把该串从输出里去掉，于是 HTML 停在 ``</tbody>``，
+    表格内容完整却不闭合。
+    """
+
+    text = "<table>\n<tr><td>a</td></tr>\n</tbody>"
+    restored = OllamaOCRExtractor.restore_stop_suffix(text, ["</table>"], "stop")
+    assert restored.endswith("</table>")
+
+
+def test_ollama_stop_restore_is_structure_aware() -> None:
+    """**不能凭空加标签**：文档里本来没有表格时不该补 `</table>`。
+
+    判据是「``<table`` 出现次数 > ``</table>`` 出现次数」——结构未闭合才补。
+    最初写成「stop 串没出现在文本里」，而那正是被移除的串，条件恒为假。
+    """
+
+    plain = "这是一段没有表格的普通文字。"
+    assert OllamaOCRExtractor.restore_stop_suffix(plain, ["</table>"], "stop") == plain
+    # 已经闭合的也不重复补
+    closed = "<table><tr><td>a</td></tr></table>"
+    assert OllamaOCRExtractor.restore_stop_suffix(closed, ["</table>"], "stop") == closed
+    # 只有 done_reason=stop 时才补（length 截断的情况尾巴本就不该有它）
+    unterminated = "<table>\n<tr><td>a</td></tr>\n</tbody>"
+    assert (
+        OllamaOCRExtractor.restore_stop_suffix(unterminated, ["</table>"], "length")
+        == unterminated
+    )
+
+
+def test_ollama_stop_sequences_go_into_options(tmp_path: Path) -> None:
+    extractor = OllamaOCRExtractor(stop_sequences=["</table>"])
+    payload = extractor.build_payload(_make_png(tmp_path))
+    assert payload["options"]["stop"] == ["</table>"]
+    # 不配时不应出现 stop 字段（空列表会让部分后端行为异常）
+    assert "stop" not in OllamaOCRExtractor().build_payload(_make_png(tmp_path))["options"]
+
+
 def test_build_extractor_selects_provider() -> None:
     """provider 决定用哪个抽取器；缺配置时返回 None 而不是偷偷换一个。"""
 

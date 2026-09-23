@@ -254,6 +254,11 @@ class VisionSettings:
     # 保留这个开关是为了"输入 token 极端敏感"的场景（如按输入计费的模型），
     # 对推理模型请保持 0。详见 evals/results/vision_cost_quality.md。
     max_image_side: int = 0
+    # 停止序列（逗号分隔）。**这是一把双刃的旋钮，默认留空。**
+    # 实测：配 ["</table>"] 后本地模型会自己停——耗时约 22s → 4s、
+    # 生成量 4096 → 688 token（快 5 倍）。但代价是**表格之后的内容会丢**，
+    # 所以只适合「整页就是一张表」的文档；图文混排不要开。
+    stop_sequences: tuple[str, ...] = ()
     prompt: str = (
         "请把这张图片中的全部文字逐字提取出来，保持原有的阅读顺序与段落结构。"
         "表格请用 Markdown 表格还原，并保留表头。"
@@ -269,6 +274,7 @@ class VisionSettings:
             "max_image_mb": self.max_image_mb,
             "max_tokens": self.max_tokens,
             "max_image_side": self.max_image_side,
+            "stop_sequences": list(self.stop_sequences),
         }
 
 
@@ -441,6 +447,7 @@ class Settings:
                 max_image_mb=_env_float("SCOUT_VLM_MAX_IMAGE_MB", 8.0, minimum=0.1),
                 max_tokens=_env_int("SCOUT_VLM_MAX_TOKENS", 16384),
                 max_image_side=_env_int("SCOUT_VLM_MAX_IMAGE_SIDE", 0, minimum=0),
+                stop_sequences=_env_list("SCOUT_VLM_STOP"),
             ),
         )
 
