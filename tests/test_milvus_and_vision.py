@@ -24,6 +24,7 @@ import pytest
 from scout.config import MilvusSettings, get_settings
 from scout.data import (
     GLMOCRExtractor,
+    OllamaOCRExtractor,
     StubTextExtractor,
     VLMTextExtractor,
     build_extractor,
@@ -309,7 +310,7 @@ def test_glm_ocr_end_to_end_with_injected_poster(tmp_path: Path) -> None:
 
 
 def test_build_extractor_selects_provider() -> None:
-    """provider 决定用哪个抽取器；glm-ocr 缺 key 时返回 None 而不是偷偷换一个。"""
+    """provider 决定用哪个抽取器；缺配置时返回 None 而不是偷偷换一个。"""
 
     vlm = build_extractor(vision_enabled=True, provider="vlm", model="kimi-k3")
     assert vlm is not None and isinstance(vlm, VLMTextExtractor)
@@ -318,6 +319,101 @@ def test_build_extractor_selects_provider() -> None:
     assert isinstance(glm, GLMOCRExtractor)
 
     assert build_extractor(vision_enabled=True, provider="glm-ocr", glm_api_key="") is None
+
+    local = build_extractor(
+        vision_enabled=True, provider="ollama", model="glm-ocr", base_url="http://127.0.0.1:11434"
+    )
+    assert isinstance(local, OllamaOCRExtractor)
+
+
+# —— 本地 Ollama 抽取 ——
+
+
+def test_ollama_uses_native_generate_endpoint(tmp_path: Path) -> None:
+    """本地走**原生** /api/generate，不是 OpenAI 兼容层。
+
+    实测教训：Ollama 的 OpenAI 兼容端点在未显式指定上下文时会硬限在约 4096 token，
+    长文档抽取的输出会在表格中间被截断、或撞上限后退化成复读。
+    原生接口才能用 options.num_ctx / num_predict 控制。
+    """
+
+    extractor = OllamaOCRExtractor(host="http://127.0.0.1:11434")
+    assert extractor.endpoint() == "http://127.0.0.1:11434/api/generate"
+    # 误配成 OpenAI 风格地址时也要能纠正回来
+    assert OllamaOCRExtractor(host="http://127.0.0.1:11434/v1").endpoint() == (
+        "http://127.0.0.1:11434/api/generate"
+    )
+
+
+def test_ollama_payload_uses_raw_base64_and_explicit_context(tmp_path: Path) -> None:
+    """原生接口要裸 base64（不带 data: 前缀），且必须显式给 num_ctx。"""
+
+    extractor = OllamaOCRExtractor(model="glm-ocr", num_ctx=16384, num_predict=4096)
+    payload = extractor.build_payload(_make_png(tmp_path))
+    assert payload["model"] == "glm-ocr"
+    assert isinstance(payload["images"], list) and len(payload["images"]) == 1
+    assert not payload["images"][0].startswith("data:")  # 裸 base64
+    assert payload["options"]["num_ctx"] == 16384
+    assert payload["options"]["num_predict"] == 4096
+    assert payload["stream"] is False
+
+
+def test_ollama_trims_degenerate_repetition() -> None:
+    """尾部复读必须裁掉。
+
+    实测：本地 glm-ocr 在表格写完后不知道停，一路输出到 num_predict 上限，
+    接着是几百行 ``` —**正文是对的，尾巴是垃圾**。
+    不裁就会污染语料，检索时还会命中这些噪声。
+
+    判据只看"尾部连续重复"，不假设文档结构，
+    所以"表格后面还有正文"的文档不会被误伤。
+    """
+
+    good = "<table>\n<tr><td>redis</td><td>6379</td></tr>\n</table>"
+    text = good + "\n" + "\n".join(["```"] * 200)
+    trimmed, removed = OllamaOCRExtractor.trim_degenerate_tail(text, min_repeat=5)
+    assert removed == 200
+    assert trimmed == good
+    assert "```" not in trimmed
+
+
+def test_ollama_keeps_legitimate_content_after_table() -> None:
+    """**不能误伤**：表格后面还有正文时，尾部不是复读就不裁。"""
+
+    text = "<table>\n<tr><td>a</td></tr>\n</table>\n\n注意事项：本节自 2026 年起生效。"
+    trimmed, removed = OllamaOCRExtractor.trim_degenerate_tail(text, min_repeat=5)
+    assert removed == 0
+    assert trimmed == text
+
+
+def test_ollama_short_repeat_is_not_trimmed() -> None:
+    """重复次数低于阈值不动手——正常的表格里也可能有连续相同单元格。"""
+
+    text = "<table>\n" + "\n".join(["<tr><td>0%</td></tr>"] * 3) + "\n</table>"
+    _trimmed, removed = OllamaOCRExtractor.trim_degenerate_tail(text, min_repeat=5)
+    assert removed == 0
+
+
+def test_ollama_warns_and_trims_on_context_exhaustion(tmp_path: Path) -> None:
+    """撞上下文上限时要同时**留警告**和**裁退化**——只做一半都会掩盖问题。"""
+
+    def poster(_url: str, _headers: dict, _payload: dict, _timeout: float) -> dict:
+        return {
+            "response": "<table><tr><td>redis</td></tr></table>\n" + "\n".join(["```"] * 50),
+            "done": True,
+            "done_reason": "length",
+            "prompt_eval_count": 1340,
+            "eval_count": 4096,
+        }
+
+    extractor = OllamaOCRExtractor(poster=poster)
+    result = extractor.extract(_make_png(tmp_path))
+    assert result.text.endswith("</table>")
+    assert any("num_predict" in w for w in result.warnings)
+    assert any("已裁掉尾部复读退化" in w for w in result.warnings)
+    assert extractor.usage_report()["total_tokens"] == 5436
+    # 本地推理零成本，这一点要在报告里说清楚
+    assert "0" in extractor.usage_report()["cost"]
 
 
 # —— Milvus 集合名与身份隔离 ——

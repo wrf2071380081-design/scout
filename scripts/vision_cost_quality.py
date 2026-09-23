@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from scout.config import get_settings  # noqa: E402
-from scout.data.extract import VLMTextExtractor  # noqa: E402
+from scout.data.extract import OllamaOCRExtractor, VLMTextExtractor  # noqa: E402
 
 # ground truth：Docker 截图里应当被抽出来的关键事实
 KEY_FACTS = [
@@ -115,15 +115,21 @@ def run_arm(
     settings: object,
 ) -> Arm:
     base, model = base_url_model(arm, settings)
-    extractor = VLMTextExtractor(
-        model=model,
-        base_url=base,
-        api_key=arm.api_key or settings.vision.api_key or settings.llm.api_key,
-        prompt=settings.vision.prompt,
-        max_tokens=arm.max_tokens,
-        max_image_side=arm.max_image_side,
-        timeout=900.0,  # 本地 CPU 推理可能很慢
-    )
+    if arm.provider == "ollama":
+        # 本地走原生 /api/generate：只有它能显式控 num_ctx / num_predict
+        extractor: object = OllamaOCRExtractor(
+            model=model, host=base, max_image_side=arm.max_image_side
+        )
+    else:
+        extractor = VLMTextExtractor(
+            model=model,
+            base_url=base,
+            api_key=arm.api_key or settings.vision.api_key or settings.llm.api_key,
+            prompt=settings.vision.prompt,
+            max_tokens=arm.max_tokens,
+            max_image_side=arm.max_image_side,
+            timeout=900.0,  # 本地 CPU 推理可能很慢
+        )
     # 直接调 _post 拿原始响应，才能统计 reasoning token——
     # 这是本实验的核心指标之一，走 extract() 会丢掉它。
     started = time.perf_counter()
@@ -131,21 +137,33 @@ def run_arm(
         payload = extractor.build_payload(image)
         data = extractor._post(payload)  # noqa: SLF001 - 实验脚本，需要原始响应
         arm.duration_ms = (time.perf_counter() - started) * 1000.0
+        # 两种后端报用量的字段名不同：
+        # OpenAI 兼容 → usage.prompt_tokens/completion_tokens
+        # Ollama 原生 → prompt_eval_count / eval_count
+        # 只读一种会让另一条路"用 0 token"，而那个 0 会被误读成"免费"
         usage = data.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or data.get("prompt_eval_count") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or data.get("eval_count") or 0)
         arm.usage = {
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": int(usage.get("total_tokens") or (prompt_tokens + completion_tokens)),
         }
         details = (usage.get("completion_tokens_details") or {})
         arm.reasoning_tokens = int(details.get("reasoning_tokens") or 0)
         arm.text = extractor.parse_response(data)
-        if extractor.last_resize:
-            arm.error = f"(已降采样 {extractor.last_resize})"
+        # last_resize 只存在于 VLMTextExtractor（云端那条）；本地 Ollama 抽取器没有——
+        # 用 getattr 取值，别让一个可选属性把整条臂打成"调用失败"
+        resize_note = getattr(extractor, "last_resize", "")
+        if resize_note:
+            arm.error = f"(已降采样 {resize_note})"
     except Exception as exc:  # noqa: BLE001 - 失败也是一种结果，必须记录
         arm.duration_ms = (time.perf_counter() - started) * 1000.0
         arm.error = f"{type(exc).__name__}: {str(exc)[:300]}"
-        arm.usage = dict(extractor.usage)
+        # 只有在还没拿到用量时才回落到抽取器的累计值——
+        # 否则会把已经读到的真实用量覆盖成 0，看起来像"这次调用免费"
+        if not arm.usage.get("total_tokens"):
+            arm.usage = dict(extractor.usage)
 
     lowered = arm.text.lower()
     arm.hits = [fact for fact in KEY_FACTS if fact.lower() in lowered]
@@ -160,11 +178,31 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_arms = [
-        Arm("A 原图", max_image_side=0, max_tokens=16384),
-        Arm("B 降采样1600px", max_image_side=1600, max_tokens=16384),
+        Arm("A 云端原图", max_image_side=0, max_tokens=16384),
+        Arm("B 云端降采样1600px", max_image_side=1600, max_tokens=16384),
+        # 本地 Ollama：**零 token 成本、零 key**。本地推理不花钱，可以随便跑——
+        # 这正是它相对云端的核心优势，也让"多试几种参数"变成没有成本的事。
+        Arm(
+            "C 本地GLM-OCR",
+            max_image_side=0,
+            max_tokens=16384,
+            base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
+            model=os.environ.get("OLLAMA_MODEL", "glm-ocr"),
+            api_key="ollama",  # Ollama 不校验
+            provider="ollama",
+        ),
+        Arm(
+            "D 本地GLM-OCR降采样",
+            max_image_side=1600,
+            max_tokens=16384,
+            base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
+            model=os.environ.get("OLLAMA_MODEL", "glm-ocr"),
+            api_key="ollama",
+            provider="ollama",
+        ),
     ]
-    # VISION_ARMS=A / B / AB —— 便于单独复现某一个臂，避免重复烧钱
-    wanted = os.environ.get("VISION_ARMS", "AB").upper()
+    # VISION_ARMS 取臂名的首字母：AB=只跑云端两臂（要花钱），CD=只跑本地两臂（免费）
+    wanted = os.environ.get("VISION_ARMS", "CD").upper()
     arms = [arm for arm in all_arms if arm.name.split()[0] in wanted] or all_arms
 
     lines = ["# 图片抽取：成本 vs 质量对照", ""]

@@ -230,6 +230,7 @@ class VisionSettings:
     enabled: bool = False
     # "vlm"=通用视觉模型（走 chat/completions，兼容 OpenAI 格式）
     # "glm-ocr"=智谱专用文档解析模型（走 /layout_parsing）
+    # "ollama"=本地 Ollama（走原生 /api/generate，零 token 成本）
     # **两者不是同一类工具**：通用 VLM 做 OCR 时 86~96% 的 token 花在推理上，
     # 而专用 OCR 模型 0.2 元/百万 token、约 1.5 秒/张。选型结论见
     # evals/results/vision_cost_quality.md。

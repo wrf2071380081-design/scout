@@ -35,7 +35,7 @@ import mimetypes
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, Sequence
 
 from ..errors import ErrorCode, ProviderError
 
@@ -91,6 +91,49 @@ class PlainTextExtractor:
             extractor=self.name,
             duration_ms=(time.perf_counter() - started) * 1000.0,
         )
+
+
+def downscale_to_base64(
+    path: Path,
+    *,
+    max_side: int = 0,
+    quality: int = 88,
+) -> tuple[str, str, str]:
+    """按最长边限制降采样后返回 ``(base64, mime, 说明)``。
+
+    抽成模块级函数，是因为**两个抽取器都要用它**：
+    云端 VLM 那条路与本地 Ollama 那条路对"输入尺寸"的敏感度不同
+    （本地实测降采样带来的收益更明显），但降采样逻辑本身没有区别。
+    逻辑只写一份，才能保证两条路的参数语义一致。
+
+    :param max_side: 0 表示不缩放。
+    """
+
+    if max_side <= 0:
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        return base64.b64encode(path.read_bytes()).decode("ascii"), mime, ""
+    try:
+        import io
+
+        from PIL import Image  # noqa: PLC0415 - 可选依赖
+    except ImportError:
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        return base64.b64encode(path.read_bytes()).decode("ascii"), mime, ""
+    with Image.open(path) as image:
+        width, height = image.size
+        longest = max(width, height)
+        if longest <= max_side:
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            return base64.b64encode(path.read_bytes()).decode("ascii"), mime, ""
+        scale = max_side / longest
+        resized = image.convert("RGB").resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.LANCZOS,
+        )
+        buffer = io.BytesIO()
+        resized.save(buffer, format="JPEG", quality=quality, optimize=True)
+        shrink = f"{width}×{height} → {resized.width}×{resized.height}（{max_side}px 上限）"
+    return base64.b64encode(buffer.getvalue()).decode("ascii"), "image/jpeg", shrink
 
 
 class VLMTextExtractor:
@@ -202,11 +245,8 @@ class VLMTextExtractor:
                 details={"size_mb": round(size_mb, 2)},
             )
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        encoded = base64.b64encode(raw).decode("ascii")
-        if self.max_image_side > 0:
-            encoded, mime, resized = self._downscale(path, mime)
-            if resized:
-                self.last_resize = resized
+        encoded, mime, note = downscale_to_base64(path, max_side=self.max_image_side)
+        self.last_resize = note
         return {
             "model": self.model,
             "messages": [
@@ -613,6 +653,216 @@ class GLMOCRExtractor:
         }
 
 
+class OllamaOCRExtractor:
+    """本地 Ollama 抽取器：走**原生** ``/api/generate``，不用 OpenAI 兼容层。
+
+    **为什么不复用 ``VLMTextExtractor``（它本来就能说 OpenAI 格式）。**
+    实测踩到的坑：Ollama 的 OpenAI 兼容端点在**不显式指定上下文长度**时，
+    输出会被硬限在约 4096 token（``prompt + completion`` 恰好等于 4096）。
+    对长文档抽取来说这个上限太小，后果是**输出在表格中间被截断**，
+    或者更隐蔽的——**模型撞上限后退化成复读**（尾部几百个 ``` 之类）。
+
+    而 ``/api/generate`` 允许在 ``options`` 里显式给 ``num_ctx`` 与 ``num_predict``，
+    这才是本地部署应有的控制力。
+
+    .. note::
+       本地推理**零 token 成本**，所以"省 token"在这里不是优化目标——
+       真正要控的是**延迟**与**输出完整性**。这也是本类把 ``num_ctx``
+       默认给到 16384 的原因：不是省，是怕截断。
+    """
+
+    name = "ollama"
+
+    def __init__(
+        self,
+        *,
+        model: str = "glm-ocr",
+        host: str = "http://127.0.0.1:11434",
+        prompt: str = "",
+        num_ctx: int = 16384,
+        num_predict: int = 4096,
+        max_image_side: int = 0,
+        min_repeat_tail: int = 5,
+        stop_sequences: Sequence[str] | None = None,
+        max_image_mb: float = 10.0,
+        max_output_chars: int = 20000,
+        timeout: float = 900.0,
+        poster: Any = None,
+    ) -> None:
+        self.model = model
+        self.host = (host or "http://127.0.0.1:11434").rstrip("/")
+        # 去掉可能被误配的 /v1 后缀——原生接口不在 /v1 下
+        if self.host.endswith("/v1"):
+            self.host = self.host[: -len("/v1")]
+        self.prompt = prompt or DEFAULT_OCR_PROMPT
+        self.num_ctx = num_ctx
+        self.num_predict = num_predict
+        self.max_image_side = max_image_side
+        self.min_repeat_tail = min_repeat_tail
+        self.stop_sequences = list(stop_sequences or [])
+        self.max_image_mb = max_image_mb
+        self.max_output_chars = max_output_chars
+        self.timeout = timeout
+        self.poster = poster
+        self.calls = 0
+        self.usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.api_key = ""
+
+    def can_handle(self, path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_SUFFIXES
+
+    def endpoint(self) -> str:
+        return f"{self.host}/api/generate"
+
+    def build_payload(self, path: Path) -> dict[str, Any]:
+        raw = path.read_bytes()
+        size_mb = len(raw) / (1024 * 1024)
+        if size_mb > self.max_image_mb:
+            raise ProviderError(
+                f"图片过大（{size_mb:.1f}MB > {self.max_image_mb}MB）",
+                code=ErrorCode.VALIDATION_FAILED,
+                operation="ollama_ocr",
+            )
+        encoded, _mime, note = downscale_to_base64(path, max_side=self.max_image_side)
+        self.last_resize = note
+        return {
+            "model": self.model,
+            "prompt": self.prompt,
+            # 原生接口要**裸 base64**（不带 data: 前缀），与 OpenAI 兼容格式不同
+            "images": [encoded],
+            "stream": False,
+            "options": {
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+                "temperature": 0.0,
+                **({"stop": self.stop_sequences} if self.stop_sequences else {}),
+            },
+        }
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.poster is not None:
+            return self.poster(self.endpoint(), {}, payload, self.timeout)
+        import requests  # noqa: PLC0415
+
+        response = requests.post(self.endpoint(), json=payload, timeout=self.timeout)
+        if not response.ok:
+            raise ProviderError(
+                f"Ollama 返回 {response.status_code}（模型 {self.model} 是否已 pull？）",
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                retryable=response.status_code >= 500,
+                operation="ollama_ocr",
+                details={"body_preview": response.text[:300]},
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ProviderError(
+                "Ollama 返回非 JSON",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                retryable=True,
+                operation="ollama_ocr",
+            ) from exc
+
+    @staticmethod
+    def parse_response(data: dict[str, Any]) -> str:
+        if data.get("error"):
+            raise ProviderError(
+                f"Ollama 业务错误：{str(data.get('error'))[:300]}",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                operation="ollama_ocr",
+            )
+        text = data.get("response")
+        if text is None:
+            raise ProviderError(
+                "Ollama 响应里没有 response 字段",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                operation="ollama_ocr",
+                details={"keys": sorted(data.keys())},
+            )
+        return str(text)
+
+    @staticmethod
+    def trim_degenerate_tail(text: str, *, min_repeat: int = 5) -> tuple[str, int]:
+        """裁掉尾部的"复读退化"。
+
+        **为什么必须有这一步。** 本地量化模型在"不知道该何时停"时会一路写到
+        ``num_predict`` 上限，然后反复输出同一个短片段（实测：表格写完后
+        跟着几百行 ``` ````）。正文是对的，但尾巴是垃圾——
+        如果原样入库，语料就会被污染，检索时还会命中这些噪声。
+
+        判据只看**尾部连续重复**，不假设文档结构：
+        从末尾往前找"同一行重复 ≥ min_repeat 次"的最长连续段并裁掉。
+        这样对"表格后面还有正文"的文档也不会误伤——
+        只有当**尾部**是复读时才动手。
+
+        返回 ``(清理后文本, 裁掉的行数)``。
+        """
+
+        lines = text.splitlines()
+        if len(lines) < min_repeat:
+            return text, 0
+        # 忽略尾部空行后再判断
+        end = len(lines)
+        while end > 0 and not lines[end - 1].strip():
+            end -= 1
+        if end == 0:
+            return text, 0
+        marker = lines[end - 1].strip()
+        run = 0
+        cursor = end
+        while cursor > 0 and lines[cursor - 1].strip() == marker:
+            run += 1
+            cursor -= 1
+        if run < min_repeat:
+            return text, 0
+        kept = lines[:cursor]
+        return "\n".join(kept).rstrip(), run
+
+    def extract(self, path: Path) -> ExtractedText:
+        started = time.perf_counter()
+        payload = self.build_payload(path)
+        self.calls += 1
+        data = self._post(payload)
+        self.usage["prompt_tokens"] += int(data.get("prompt_eval_count") or 0)
+        self.usage["completion_tokens"] += int(data.get("eval_count") or 0)
+        self.usage["total_tokens"] = self.usage["prompt_tokens"] + self.usage["completion_tokens"]
+        text = self.parse_response(data)
+
+        warnings: list[str] = []
+        if str(data.get("done_reason") or "") == "length":
+            warnings.append(
+                f"输出撞上 num_predict={self.num_predict}——本地模型在不知道该何时停时"
+                "会一路写满，已尝试裁剪尾部退化"
+            )
+        trimmed_text, removed = self.trim_degenerate_tail(text, min_repeat=self.min_repeat_tail)
+        if removed:
+            text = trimmed_text
+            warnings.append(f"已裁掉尾部复读退化 {removed} 行")
+        if not text.strip():
+            warnings.append("Ollama 返回空文本——该文件未被有效入库")
+        if len(text) > self.max_output_chars:
+            text = text[: self.max_output_chars]
+            warnings.append(f"抽取结果超过 {self.max_output_chars} 字符，已截断")
+        return ExtractedText(
+            source=path.name,
+            text=text,
+            extractor=self.name,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            warnings=warnings,
+        )
+
+    def usage_report(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            **dict(self.usage),
+            "cost": "0（本地推理，零 token 成本）",
+        }
+
+
 class StubTextExtractor:
     """离线替身：不联网，按文件名返回预设文本。
 
@@ -639,6 +889,13 @@ class StubTextExtractor:
             extractor=self.name,
             warnings=["离线替身抽取，仅供测试"] if text else ["离线替身没有任何可用文本"],
         )
+
+
+DEFAULT_OCR_PROMPT = (
+    "请把这张图片中的全部文字逐字提取出来，保持原有的阅读顺序。\n"
+    "表格请输出为 HTML 表格（<table>），保留表头与单元格对应关系。\n"
+    "只输出内容本身，不要任何解释、总结、前后缀，也不要重复输出。"
+)
 
 
 DEFAULT_VISION_PROMPT = (
@@ -682,6 +939,7 @@ def build_extractor(
     glm_base_url: str = "https://open.bigmodel.cn",
     glm_api_key: str = "",
     glm_model: str = "glm-ocr",
+    stop_sequences: Any = None,
     allow_stub: bool = False,
 ) -> TextExtractor | None:
     """按配置挑图片抽取器。**挑不到就返回 None，而不是偷偷用一个假的。**
@@ -690,6 +948,13 @@ def build_extractor(
     这类静默失效会让"入库了多少内容"这件事无法核对。
     """
 
+    if vision_enabled and provider == "ollama":
+        # 本地 Ollama：走原生 /api/generate 才能显式控制 num_ctx/num_predict
+        return OllamaOCRExtractor(
+            model=model or "glm-ocr",
+            host=base_url or "http://127.0.0.1:11434",
+            stop_sequences=list(stop_sequences or []) if hasattr(stop_sequences, "__iter__") else None,
+        )
     if vision_enabled and provider == "glm-ocr":
         # 专用文档解析模型：不走 chat/completions，走 /layout_parsing。
         # 缺 key 时返回 None 而不是"回退到通用 VLM"——**静默换工具会让
@@ -766,7 +1031,9 @@ def load_documents_with_extraction(
 
 
 __all__ = [
+    "DEFAULT_OCR_PROMPT",
     "DEFAULT_VISION_PROMPT",
+    "OllamaOCRExtractor",
     "ExtractedText",
     "ExtractionOutcome",
     "IMAGE_SUFFIXES",
