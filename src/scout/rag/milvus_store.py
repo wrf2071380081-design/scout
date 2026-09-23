@@ -130,6 +130,26 @@ class MilvusDenseStore:
         self._client = MilvusClient(uri=self.uri, token=self.token or "", timeout=self.timeout)
         return self._client
 
+    @staticmethod
+    def looks_like_connection_error(message: str) -> bool:
+        """区分"连不上"与"连上了但用法有错"。
+
+        两者的修复动作完全不同：前者去起容器，后者改代码。
+        把 schema 冲突也报成"先把容器起来"，会让人白白折腾半天。
+        """
+
+        lowered = (message or "").lower()
+        markers = (
+            "fail connecting to server",
+            "connection refused",
+            "connection reset",
+            "unavailable",
+            "timed out",
+            "timeout",
+            "no route to host",
+        )
+        return any(marker in lowered for marker in markers)
+
     def ping(self) -> bool:
         """连通性探测。**失败只记录不抛**——调用方需要据此决定降级还是报错。"""
 
@@ -143,6 +163,34 @@ class MilvusDenseStore:
             return False
 
     # —— 写入 ——
+
+    def _create_collection(self, client: Any, name: str, dimension: int) -> None:
+        """显式声明 schema——**不要依赖 create_collection 的默认字段类型**。
+
+        ``MilvusClient.create_collection(dimension=...)`` 的便捷写法会把主键 ``id``
+        默认建成 **int64**。我们的 chunk_id 是字符串（形如 ``doc-000#L3#12``），
+        于是写入时报 ``DataNotMatchException: {id} field should be a int64``。
+
+        **这个错误只有联机才会暴露**：离线单测用的是内存索引，根本走不到建表那一步。
+        所以 schema 必须写死在这里，而不是交给默认值——
+        默认值会随 pymilvus 版本变化，而这类变化的表现是"某天突然写不进去了"。
+        """
+
+        from pymilvus import DataType, MilvusClient  # noqa: PLC0415 - 可选依赖
+
+        schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+        # max_length 要够：chunk_id 是 "{document_id}#L{level}#{index}"，
+        # 文档 id 里可能带较长的文件名派生串
+        schema.add_field(field_name="id", datatype=DataType.VARCHAR, is_primary=True, max_length=512)
+        schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=int(dimension))
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="vector",
+            index_type=self.index_type,
+            metric_type=self.metric_type,
+            params={"M": 16, "efConstruction": 200},
+        )
+        client.create_collection(collection_name=name, schema=schema, index_params=index_params)
 
     def sync(
         self,
@@ -167,17 +215,7 @@ class MilvusDenseStore:
             if recreate and client.has_collection(name):
                 client.drop_collection(name)
             if not client.has_collection(name):
-                client.create_collection(
-                    collection_name=name,
-                    dimension=int(dimension),
-                    metric_type=self.metric_type,
-                    auto_id=False,
-                    index_params={
-                        "index_type": self.index_type,
-                        "metric_type": self.metric_type,
-                        "params": {"M": 16, "efConstruction": 200},
-                    },
-                )
+                self._create_collection(client, name, int(dimension))
             if items:
                 client.insert(
                     collection_name=name,

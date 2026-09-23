@@ -97,12 +97,28 @@ def main() -> int:
             strict=True,
         )
     except Exception as exc:  # noqa: BLE001 - 连不上就是这份报告的核心结论
+        from scout.rag.milvus_store import MilvusDenseStore
+
+        detail = f"{type(exc).__name__}: {exc}"
         lines.append("## 结论：Milvus 不可用")
         lines.append("")
-        lines.append(f"```\n{type(exc).__name__}: {exc}\n```")
+        lines.append(f"```\n{detail}\n```")
         lines.append("")
-        lines.append("**先把容器起来**：`docker start milvus-etcd milvus-minio milvus-standalone`")
-        lines.append("（Milvus standalone 依赖 etcd 与 MinIO，缺一不可。）")
+        # 区分"连不上"与"连上了但用法有错"——修复动作完全不同，
+        # 把 schema 冲突也报成"先把容器起来"会让人白折腾半天。
+        if MilvusDenseStore.looks_like_connection_error(detail):
+            lines.append("**诊断：连不上服务。** 先把容器起来：")
+            lines.append("")
+            lines.append("```")
+            lines.append("docker start milvus-etcd milvus-minio milvus-standalone")
+            lines.append("```")
+            lines.append("")
+            lines.append("（Milvus standalone 依赖 etcd 与 MinIO，缺一不可。）")
+        else:
+            lines.append(
+                "**诊断：服务连上了，但这次调用失败——是用法/数据层面的问题，不是容器没起。**"
+            )
+            lines.append("请按上面的异常信息排查（集合 schema、字段类型、索引参数等）。")
         OUT_MD.parent.mkdir(parents=True, exist_ok=True)
         OUT_MD.write_text("\n".join(lines), encoding="utf-8")
         print("\n".join(lines))
@@ -180,10 +196,36 @@ def main() -> int:
             "- **重合度就是 ANN 召回**：它回答「为了这个延迟，我们付出了几个百分点的召回」。"
             "重合度高说明参数（M / efConstruction / ef）够用；偏低就该调参或换 IVF_FLAT。"
         )
+
+        # 延迟结论**由数据算出来**，不写死。
+        # 这条是踩过的坑：脚本初版写着「小语料下内存往往更快（省一次网络往返）」，
+        # 而实测在 156 个向量时 Milvus 就已经更快（9.3ms vs 15.7ms）——
+        # 因为内存实现是纯 Python 逐条算余弦，瓶颈在解释器开销，
+        # 一次网络往返（几毫秒）跟它比可以忽略。
+        # **报告里不该出现没有数据支持的解读**，所以这里改成按实测下结论。
+        mem_p50 = _percentile(memory_latency, 0.5)
+        mil_p50 = _percentile(milvus_latency, 0.5)
+        if mil_p50 < mem_p50:
+            ratio = mem_p50 / mil_p50 if mil_p50 else 0.0
+            lines.append(
+                f"- **延迟：Milvus 更快（p50 {mil_p50:.1f}ms vs 内存 {mem_p50:.1f}ms，约 {ratio:.1f}×）。**"
+                " 原因不是向量库更快，而是**我们的内存实现是纯 Python 逐条算余弦**——"
+                "它的定位是「精确、可复现的召回基线」，不是性能实现。"
+                "一次网络往返（几毫秒）相对解释器开销可以忽略，所以这个反直觉的结果是合理的。"
+            )
+            lines.append(
+                "  **要真比性能，应该把内存版换成 numpy 批量矩阵乘**——"
+                "那才能把「算法差异」和「实现语言差异」分开。"
+            )
+        else:
+            lines.append(
+                f"- 延迟：内存更快（p50 {mem_p50:.1f}ms vs Milvus {mil_p50:.1f}ms）——"
+                "小规模下省掉一次网络往返的收益超过了索引结构的优势。"
+            )
         lines.append(
-            "- 语料只有几十篇时，**内存往往更快**（省掉一次网络往返）——"
-            "向量库的价值在于规模与多副本，不在小语料上的延迟。"
-            "把这一点写清楚，比声称「接了向量库所以更快」更可信。"
+            "- **重合度 100% 在小规模上是必然的**：几百个向量时 HNSW 几乎等价于暴力检索。"
+            "所以这个数字此刻的意义是「参数没配错」，不是「我们的 ANN 很好」——"
+            "**要得到有信息量的 ANN 召回，必须把规模拉到万级以上再测。**"
         )
     else:
         lines.append("- 没有可比较的检索结果（语料或查询为空）。")
