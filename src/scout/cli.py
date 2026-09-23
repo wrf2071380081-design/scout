@@ -394,6 +394,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             base_url=settings.vision.base_url or settings.llm.base_url,
             api_key=settings.vision.api_key or settings.llm.api_key,
             prompt=settings.vision.prompt,
+            max_tokens=settings.vision.max_tokens,
+            max_image_side=settings.vision.max_image_side,
         )
         if extractor is None:
             print("已指定 --images，但没有可用的视觉抽取器。")
@@ -417,6 +419,16 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             print(f"  ✗ {skipped}")
         for warning in outcome.warnings[:5]:
             print(f"  ! {warning}")
+        # token 成本必须可见：图片抽取按张计费，一批扫描件的成本不该靠猜
+        usage_report = getattr(extractor, "usage_report", None)
+        if callable(usage_report):
+            usage = usage_report()
+            if usage.get("calls"):
+                print(
+                    f"  token   : 共 {usage['total_tokens']}（prompt {usage['prompt_tokens']} + "
+                    f"completion {usage['completion_tokens']}）｜ "
+                    f"平均 {usage['avg_tokens_per_image']}/张"
+                )
         print()
     else:
         documents = load_corpus(directory, max_files=args.limit or None)

@@ -144,6 +144,58 @@ def test_vlm_handles_chunked_content(tmp_path: Path) -> None:
     assert extractor.extract(_make_png(tmp_path)).text == "第一段第二段"
 
 
+def test_vlm_distinguishes_reasoning_only_from_blind_model(tmp_path: Path) -> None:
+    """**关键区分**：``content`` 为空时，是"预算被推理吃了"还是"没看到图"？
+
+    这两种情况现象一样（都拿到空文本），修复动作却完全不同：
+    前者调大 ``max_tokens``，后者要换模型。
+    实测 kimi-k3 就是推理模型——第一次探测因为 ``max_tokens=32`` 被推理 token 吃光，
+    ``content`` 为空，差点得出"它不支持图像"的相反结论。
+    """
+
+    def poster(*_args: object) -> dict:
+        return {
+            "choices": [
+                {
+                    "message": {"content": "", "reasoning_content": "图中写的是 7391，直接回答即可"},
+                    "finish_reason": "length",
+                }
+            ]
+        }
+
+    extractor = VLMTextExtractor(model="vl", base_url="https://x/v1", poster=poster)
+    with pytest.raises(ProviderError) as excinfo:
+        extractor.extract(_make_png(tmp_path))
+    message = str(excinfo.value)
+    assert "只输出了推理内容" in message
+    assert "max_tokens" in message
+    # 必须可重试：这是配置问题，不是模型能力问题
+    assert excinfo.value.retryable is True
+
+
+def test_vlm_reasoning_is_never_used_as_extracted_text(tmp_path: Path) -> None:
+    """思考过程绝不能当抽取结果——入库后会污染语料。
+
+    ``reasoning_content`` 里混着"我应该逐字提取"这类元话语，
+    把它当正文，等于往语料库塞了文档里没有的句子。
+    """
+
+    extractor = VLMTextExtractor(model="vl", base_url="https://x/v1")
+    text = VLMTextExtractor.parse_response(
+        {"choices": [{"message": {"content": "真正的正文", "reasoning_content": "元话语"}}]}
+    )
+    assert text == "真正的正文"
+    assert "元话语" not in text
+
+
+def test_vlm_payload_sets_max_tokens(tmp_path: Path) -> None:
+    """必须显式给足 max_tokens：不给或给太小会被推理阶段吃光。"""
+
+    extractor = VLMTextExtractor(model="vl", base_url="https://x/v1", max_tokens=2048)
+    payload = extractor.build_payload(_make_png(tmp_path))
+    assert payload["max_tokens"] == 2048
+
+
 def test_image_without_extractor_is_rejected(tmp_path: Path) -> None:
     """图片路径必须显式失败，绝不能静默跳过。"""
 

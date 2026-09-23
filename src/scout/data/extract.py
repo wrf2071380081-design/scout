@@ -114,6 +114,8 @@ class VLMTextExtractor:
         prompt: str = "",
         max_image_mb: float = 8.0,
         max_output_chars: int = 20000,
+        max_tokens: int = 8192,
+        max_image_side: int = 0,
         timeout: float = 120.0,
         poster: Any = None,
     ) -> None:
@@ -123,9 +125,56 @@ class VLMTextExtractor:
         self.prompt = prompt or DEFAULT_VISION_PROMPT
         self.max_image_mb = max_image_mb
         self.max_output_chars = max_output_chars
+        self.max_tokens = max_tokens
+        self.max_image_side = max_image_side
         self.timeout = timeout
         self.poster = poster
         self.calls = 0
+        self.usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.last_resize = ""
+
+    def can_handle(self, path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_SUFFIXES
+
+    def _downscale(self, path: Path, mime: str) -> tuple[str, str, str]:
+        """按最长边限制降采样后重新编码。
+
+        **为什么值得做。** 图片 token 与像素面积大致成正比，
+        而多数视觉编码器在超过 ~1600px 后**不会获得额外信息收益**——
+        多出来的像素只是在推高账单。降采样既省钱又常能降低推理开销。
+
+        **但要小心**：降太多会让小字号文字糊掉，抽取质量反而下降。
+        所以这里只做"超长边"限制，且把实际缩放比例**记进警告**——
+        比例太狠时人能立刻看出来该调参数，而不是等核对抽取结果才发现问题。
+        """
+
+        try:
+            import io
+
+            from PIL import Image  # noqa: PLC0415 - 可选依赖
+        except ImportError:
+            return base64.b64encode(path.read_bytes()).decode("ascii"), mime, ""
+        with Image.open(path) as image:
+            width, height = image.size
+            longest = max(width, height)
+            if longest <= self.max_image_side:
+                return base64.b64encode(path.read_bytes()).decode("ascii"), mime, ""
+            scale = self.max_image_side / longest
+            resized = image.convert("RGB").resize(
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                Image.LANCZOS,
+            )
+            buffer = io.BytesIO()
+            resized.save(buffer, format="JPEG", quality=88, optimize=True)
+        return (
+            base64.b64encode(buffer.getvalue()).decode("ascii"),
+            "image/jpeg",
+            f"{width}×{height} → {resized.width}×{resized.height}（{self.max_image_side}px 上限）",
+        )
 
     def can_handle(self, path: Path) -> bool:
         return path.suffix.lower() in IMAGE_SUFFIXES
@@ -152,6 +201,10 @@ class VLMTextExtractor:
             )
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
         encoded = base64.b64encode(raw).decode("ascii")
+        if self.max_image_side > 0:
+            encoded, mime, resized = self._downscale(path, mime)
+            if resized:
+                self.last_resize = resized
         return {
             "model": self.model,
             "messages": [
@@ -167,6 +220,10 @@ class VLMTextExtractor:
                 }
             ],
             "temperature": 0.0,
+            # **必须显式给足 max_tokens。** 推理模型（如本网关的 kimi-k3）会先花 token
+            # 输出 reasoning_content，再输出正文；不给或给太小会出现
+            # "响应 200、content 为空"——看起来像模型没看到图，实际是预算被吃光。
+            "max_tokens": self.max_tokens,
         }
 
     def endpoint(self) -> str:
@@ -226,6 +283,21 @@ class VLMTextExtractor:
 
     @staticmethod
     def parse_response(data: dict[str, Any]) -> str:
+        """从响应里取出抽取结果。
+
+        **只取 ``message.content``，不取 ``reasoning_content``。**
+        很多模型（含本网关的 ``kimi-k3``）是**推理模型**：先输出思考过程到
+        ``reasoning_content``，再输出答案到 ``content``。
+        思考过程里混着"我应该逐字提取"这类元话语，**把它当抽取结果会污染语料**——
+        入库后检索会命中这些本不属于文档的句子。
+
+        但 ``reasoning_content`` 有一个不可替代的用途：**诊断**。
+        ``content`` 为空而 ``reasoning_content`` 非空，说明输出预算被推理阶段吃光了
+        （``finish_reason=length``），而不是模型没看到图。
+        **这两种情况的现象一样（都拿到空文本），修复动作却完全不同**：
+        前者调大 ``max_tokens``，后者要换模型。所以这里把区别体现在抛出的错误里。
+        """
+
         choices = data.get("choices") or []
         if not choices:
             raise ProviderError(
@@ -233,19 +305,47 @@ class VLMTextExtractor:
                 code=ErrorCode.PROVIDER_INVALID_RESPONSE,
                 operation="vision_extract",
             )
-        content = (choices[0].get("message") or {}).get("content")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
         if isinstance(content, list):
             # 有些网关返回分片数组，拼接其中的 text 部分
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return str(content or "")
+        text = str(content or "")
+        if text.strip():
+            return text
+
+        reasoning = str(message.get("reasoning_content") or "")
+        finish = str(choices[0].get("finish_reason") or "")
+        if reasoning.strip():
+            raise ProviderError(
+                "视觉模型只输出了推理内容、正文为空"
+                f"（finish_reason={finish or '未知'}）——大概率是输出预算被推理阶段耗尽，"
+                "请调大 max_tokens；若反复出现则说明该模型不适合做抽取",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                retryable=True,
+                operation="vision_extract",
+                details={"finish_reason": finish, "reasoning_chars": len(reasoning)},
+            )
+        if finish == "length":
+            raise ProviderError(
+                "视觉模型输出被长度限制截断且没有正文——请调大 max_tokens",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                retryable=True,
+                operation="vision_extract",
+                details={"finish_reason": finish},
+            )
+        return ""
 
     def extract(self, path: Path) -> ExtractedText:
         started = time.perf_counter()
         payload = self.build_payload(path)
         self.calls += 1
         data = self._post(payload)
+        self._accumulate_usage(data)
         text = self.parse_response(data)
         warnings: list[str] = []
+        if self.last_resize:
+            warnings.append(f"已降采样：{self.last_resize}")
         if not text.strip():
             # 空结果必须报警：它会让这篇文档"入库成功但什么都没进"，静默丢数据
             warnings.append("视觉模型返回空文本——该文件未被有效入库")
@@ -260,6 +360,28 @@ class VLMTextExtractor:
             duration_ms=(time.perf_counter() - started) * 1000.0,
             warnings=warnings,
         )
+
+    def _accumulate_usage(self, data: dict[str, Any]) -> None:
+        """累计 token 用量。
+
+        **图片抽取是"按张计费"里最容易被低估的一项**：单张图的视觉 token
+        可能上千，一批扫描件跑下来成本不低。不把用量记下来，
+        "图片入库要花多少钱"就只能靠猜——而这正好是岗位职责里
+        "成本控制"要回答的问题。
+        """
+
+        usage = data.get("usage") or {}
+        self.usage["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+        self.usage["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+        self.usage["total_tokens"] += int(usage.get("total_tokens") or 0)
+
+    def usage_report(self) -> dict[str, Any]:
+        total = self.usage["total_tokens"]
+        return {
+            "calls": self.calls,
+            **dict(self.usage),
+            "avg_tokens_per_image": round(total / self.calls, 1) if self.calls else 0.0,
+        }
 
 
 class StubTextExtractor:
@@ -325,6 +447,8 @@ def build_extractor(
     base_url: str = "",
     api_key: str = "",
     prompt: str = "",
+    max_tokens: int = 8192,
+    max_image_side: int = 0,
     allow_stub: bool = False,
 ) -> TextExtractor | None:
     """按配置挑图片抽取器。**挑不到就返回 None，而不是偷偷用一个假的。**
@@ -335,7 +459,12 @@ def build_extractor(
 
     if vision_enabled and model:
         return VLMTextExtractor(
-            model=model, base_url=base_url, api_key=api_key, prompt=prompt
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            max_image_side=max_image_side,
         )
     if allow_stub:
         return StubTextExtractor(default="")

@@ -233,6 +233,13 @@ class VisionSettings:
     model: str = ""
     max_image_mb: float = 8.0
     max_output_chars: int = 20000
+    # 输出预算。**推理模型会先花 token 思考，再输出正文**：
+    # 实测 kimi-k3 在一张 2086×466 的截图上，4096 的预算被推理全部吃光、正文为空。
+    # 所以默认给足；调小会在真实文档上出现"200 但没内容"。
+    max_tokens: int = 8192
+    # 最长边上限（0=不缩放）。图片 token 与像素面积成正比，
+    # 超过 ~1600px 后多数编码器不再增益，多出来的只是在推高账单。
+    max_image_side: int = 0
     prompt: str = (
         "请把这张图片中的全部文字逐字提取出来，保持原有的阅读顺序与段落结构。"
         "表格请用 Markdown 表格还原，并保留表头。"
@@ -245,6 +252,8 @@ class VisionSettings:
             "model": self.model,
             "base_url": self.base_url or "(复用 LLM 配置)",
             "max_image_mb": self.max_image_mb,
+            "max_tokens": self.max_tokens,
+            "max_image_side": self.max_image_side,
         }
 
 
@@ -411,6 +420,8 @@ class Settings:
                 api_key=_env_str("SCOUT_VLM_API_KEY", ""),
                 model=_env_str("SCOUT_VLM_MODEL", ""),
                 max_image_mb=_env_float("SCOUT_VLM_MAX_IMAGE_MB", 8.0, minimum=0.1),
+                max_tokens=_env_int("SCOUT_VLM_MAX_TOKENS", 8192),
+                max_image_side=_env_int("SCOUT_VLM_MAX_IMAGE_SIDE", 0, minimum=0),
             ),
         )
 
