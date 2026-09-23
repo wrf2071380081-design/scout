@@ -114,7 +114,7 @@ class VLMTextExtractor:
         prompt: str = "",
         max_image_mb: float = 8.0,
         max_output_chars: int = 20000,
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         max_image_side: int = 0,
         max_attempts: int = 2,
         timeout: float = 600.0,
@@ -465,7 +465,7 @@ def build_extractor(
     base_url: str = "",
     api_key: str = "",
     prompt: str = "",
-    max_tokens: int = 8192,
+    max_tokens: int = 16384,
     max_image_side: int = 0,
     allow_stub: bool = False,
 ) -> TextExtractor | None:

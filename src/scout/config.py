@@ -236,7 +236,7 @@ class VisionSettings:
     # 输出预算。**推理模型会先花 token 思考，再输出正文**：
     # 实测 kimi-k3 在一张 2086×466 的截图上，4096 的预算被推理全部吃光、正文为空。
     # 所以默认给足；调小会在真实文档上出现"200 但没内容"。
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     # 最长边上限（0=不缩放）。
     # **默认关闭，而且实测证明它不划算**：降采样确实把 prompt 从 1417 降到 896（−37%），
     # 但推理模型的总额被 reasoning 主导（同一张图的三次实测：1814 / 7271 / 11041），
@@ -424,7 +424,7 @@ class Settings:
                 api_key=_env_str("SCOUT_VLM_API_KEY", ""),
                 model=_env_str("SCOUT_VLM_MODEL", ""),
                 max_image_mb=_env_float("SCOUT_VLM_MAX_IMAGE_MB", 8.0, minimum=0.1),
-                max_tokens=_env_int("SCOUT_VLM_MAX_TOKENS", 8192),
+                max_tokens=_env_int("SCOUT_VLM_MAX_TOKENS", 16384),
                 max_image_side=_env_int("SCOUT_VLM_MAX_IMAGE_SIDE", 0, minimum=0),
             ),
         )
