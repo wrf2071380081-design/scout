@@ -116,7 +116,8 @@ class VLMTextExtractor:
         max_output_chars: int = 20000,
         max_tokens: int = 8192,
         max_image_side: int = 0,
-        timeout: float = 120.0,
+        max_attempts: int = 2,
+        timeout: float = 600.0,
         poster: Any = None,
     ) -> None:
         self.model = model
@@ -127,6 +128,7 @@ class VLMTextExtractor:
         self.max_output_chars = max_output_chars
         self.max_tokens = max_tokens
         self.max_image_side = max_image_side
+        self.max_attempts = max(max_attempts, 1)
         self.timeout = timeout
         self.poster = poster
         self.calls = 0
@@ -339,11 +341,27 @@ class VLMTextExtractor:
     def extract(self, path: Path) -> ExtractedText:
         started = time.perf_counter()
         payload = self.build_payload(path)
-        self.calls += 1
-        data = self._post(payload)
-        self._accumulate_usage(data)
-        text = self.parse_response(data)
         warnings: list[str] = []
+        text = ""
+        last_error: ProviderError | None = None
+        # 重试一次。**实测网关会偶发 `finish_reason=content_filter`**（同一张图、
+        # 同样的请求，再跑一次就成功），不是确定性拒绝。
+        # 不重试会把偶发故障当成"这张图不能抽"，进而丢掉一篇文档。
+        for attempt in range(1, self.max_attempts + 1):
+            self.calls += 1
+            try:
+                data = self._post(payload)
+                self._accumulate_usage(data)
+                text = self.parse_response(data)
+                break
+            except ProviderError as exc:
+                last_error = exc
+                if not exc.retryable or attempt >= self.max_attempts:
+                    raise
+                time.sleep(0.8 * attempt)
+        if last_error is not None and not text:
+            raise last_error
+
         if self.last_resize:
             warnings.append(f"已降采样：{self.last_resize}")
         if not text.strip():
