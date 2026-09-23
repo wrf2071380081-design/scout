@@ -390,17 +390,26 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     if args.images:
         extractor = build_extractor(
             vision_enabled=settings.vision.enabled,
+            provider=settings.vision.provider,
             model=settings.vision.model,
             base_url=settings.vision.base_url or settings.llm.base_url,
             api_key=settings.vision.api_key or settings.llm.api_key,
             prompt=settings.vision.prompt,
             max_tokens=settings.vision.max_tokens,
             max_image_side=settings.vision.max_image_side,
+            glm_base_url=settings.vision.glm_base_url,
+            glm_api_key=settings.vision.glm_api_key,
+            glm_model=settings.vision.glm_model,
         )
         if extractor is None:
-            print("已指定 --images，但没有可用的视觉抽取器。")
-            print("请设置：set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
-            print("（也可以用 SCOUT_VLM_BASE_URL / SCOUT_VLM_API_KEY 指定独立网关）")
+            print("已指定 --images，但没有可用的抽取器。")
+            if settings.vision.provider == "glm-ocr":
+                print("provider=glm-ocr，需要：set SCOUT_VISION_ENABLED=1 与 set SCOUT_GLM_API_KEY=<智谱key>")
+                print("（在 https://open.bigmodel.cn 获取；0.2 元/百万 token，约 1 元/2000 张 A4）")
+            else:
+                print("provider=vlm，需要：set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
+                print("（也可以用 SCOUT_VLM_BASE_URL / SCOUT_VLM_API_KEY 指定独立网关）")
+                print("提示：OCR 类任务用专用模型更划算——set SCOUT_OCR_PROVIDER=glm-ocr")
             return 1
         suffixes = TEXT_SUFFIXES | IMAGE_SUFFIXES
         files = sorted(

@@ -20,6 +20,7 @@ from .dedup import (
     simhash,
 )
 from .extract import (
+    GLMOCRExtractor,
     ExtractedText,
     ExtractionOutcome,
     PlainTextExtractor,
@@ -44,6 +45,7 @@ __all__ = [
     "DedupReport",
     "DocumentVersion",
     "ExtractedText",
+    "GLMOCRExtractor",
     "ExtractionOutcome",
     "IngestReport",
     "LayoutReport",

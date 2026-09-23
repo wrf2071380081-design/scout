@@ -402,6 +402,217 @@ class VLMTextExtractor:
         }
 
 
+class GLMOCRExtractor:
+    """智谱 GLM-OCR：**专用文档解析模型**，与通用 VLM 是两种不同的工具。
+
+    **为什么它在这个项目里更合适（不是"另一个可选模型"，是更对的工具）：**
+
+    | | 通用推理 VLM（kimi-k3） | GLM-OCR |
+    |---|---|---|
+    | 单张成本 | 实测 3.5k~12k token，波动 3.4× | **0.2 元/百万 token，1 元≈2000 张 A4** |
+    | 单张耗时 | 实测 67~270 秒 | **约 1.5 秒**（0.67 张/秒） |
+    | token 去向 | **86~96% 花在推理上**（OCR 不需要推理） | 全部用于识别 |
+    | 表格 | 输出 Markdown（准，但靠通用能力） | **针对合并单元格 / 多层表头优化，直出 HTML/Markdown** |
+    | 榜单 | 无 OCR 专项成绩 | **OmniDocBench V1.5 第一（94.62）** |
+
+    更关键的一点：它的**两阶段流水线（版面分析 → 并行区域识别）**，
+    与本项目数据层做的"双栏还原 / 跨页表格表头补写"是**同一个问题的两层解法**——
+    它做页面级版面分析，我们做文本级后处理。**这不是拼凑，是能力互补。**
+
+    .. note::
+       **响应字段名不做假设。** 官方文档只说明"返回 Markdown 与 JSON 版面信息"，
+       没有给出精确的字段路径，而这类接口的字段名各版本会变。
+       所以 :meth:`parse_response` 用一组候选键去探，探不到就**把真实键名报出来**——
+       猜错字段名的表现是"抽取成功但内容为空"，那是最难查的一种静默失败。
+    """
+
+    name = "glm-ocr"
+
+    #: 常见的返回字段候选。不同版本可能用其中之一。
+    TEXT_KEYS = ("md_results", "markdown", "md", "text", "content", "result", "data")
+
+    def __init__(
+        self,
+        *,
+        model: str = "glm-ocr",
+        base_url: str = "https://open.bigmodel.cn",
+        api_key: str = "",
+        max_image_mb: float = 10.0,
+        max_output_chars: int = 20000,
+        max_attempts: int = 2,
+        timeout: float = 300.0,
+        poster: Any = None,
+    ) -> None:
+        self.model = model
+        self.base_url = (base_url or "https://open.bigmodel.cn").rstrip("/")
+        self.api_key = api_key
+        self.max_image_mb = max_image_mb
+        self.max_output_chars = max_output_chars
+        self.max_attempts = max(max_attempts, 1)
+        self.timeout = timeout
+        self.poster = poster
+        self.calls = 0
+        self.usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.last_keys: list[str] = []
+
+    def can_handle(self, path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_SUFFIXES
+
+    def endpoint(self) -> str:
+        """``/layout_parsing`` 是专门的文档解析端点，不是 chat/completions。"""
+
+        trimmed = self.base_url
+        if trimmed.endswith("/v4"):
+            return f"{trimmed}/layout_parsing"
+        return f"{trimmed}/api/paas/v4/layout_parsing"
+
+    def build_payload(self, path: Path) -> dict[str, Any]:
+        raw = path.read_bytes()
+        size_mb = len(raw) / (1024 * 1024)
+        if size_mb > self.max_image_mb:
+            raise ProviderError(
+                f"图片过大（{size_mb:.1f}MB > {self.max_image_mb}MB）",
+                code=ErrorCode.VALIDATION_FAILED,
+                operation="glm_ocr",
+                details={"size_mb": round(size_mb, 2)},
+            )
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(raw).decode("ascii")
+        # 官方说明：上游接受 URL 或 data URI；裸 base64 必须包成 data URI
+        return {"model": self.model, "file": f"data:{mime};base64,{encoded}"}
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = self.endpoint()
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.poster is not None:
+            return self.poster(url, headers, payload, self.timeout)
+        import requests  # noqa: PLC0415
+
+        response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        if not response.ok:
+            raise ProviderError(
+                f"GLM-OCR 返回 {response.status_code}",
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                retryable=response.status_code >= 500,
+                operation="glm_ocr",
+                details={"body_preview": response.text[:300]},
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ProviderError(
+                "GLM-OCR 返回非 JSON",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                retryable=True,
+                operation="glm_ocr",
+            ) from exc
+
+    def parse_response(self, data: dict[str, Any]) -> str:
+        """在候选键里找正文。
+
+        找不到时**把真实键名报出来**——猜错字段名会表现为"抽取成功但内容为空"，
+        而"内容为空"又会被上层当成"这篇文档没内容"，最终静默丢数据。
+        把键名报出来，这个问题就从"要调试"变成"看一眼就改"。
+        """
+
+        self.last_keys = sorted(data.keys())
+        for key in self.TEXT_KEYS:
+            value = data.get(key)
+            text = self._coerce_text(value)
+            if text.strip():
+                return text
+        # 再探一层：有些版本把结果包在 data/results 里
+        for outer in ("data", "result", "results"):
+            inner = data.get(outer)
+            if isinstance(inner, dict):
+                for key in self.TEXT_KEYS:
+                    text = self._coerce_text(inner.get(key))
+                    if text.strip():
+                        return text
+        if data.get("error"):
+            raise ProviderError(
+                f"GLM-OCR 业务错误：{str(data.get('error'))[:300]}",
+                code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+                operation="glm_ocr",
+            )
+        raise ProviderError(
+            "GLM-OCR 响应里找不到正文——请按实际字段名更新 TEXT_KEYS"
+            f"（实际顶层键：{self.last_keys}）",
+            code=ErrorCode.PROVIDER_INVALID_RESPONSE,
+            operation="glm_ocr",
+            details={"keys": self.last_keys},
+        )
+
+    @staticmethod
+    def _coerce_text(value: Any) -> str:
+        """把各种可能的结构摊成字符串（字符串 / 列表 / 带 markdown 字段的字典）。"""
+
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = [GLMOCRExtractor._coerce_text(item) for item in value]
+            return "\n".join(part for part in parts if part.strip())
+        if isinstance(value, dict):
+            for key in ("markdown", "md", "text", "content"):
+                if key in value:
+                    inner = GLMOCRExtractor._coerce_text(value[key])
+                    if inner.strip():
+                        return inner
+        return ""
+
+    def extract(self, path: Path) -> ExtractedText:
+        started = time.perf_counter()
+        payload = self.build_payload(path)
+        text = ""
+        last_error: ProviderError | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            self.calls += 1
+            try:
+                data = self._post(payload)
+                usage = data.get("usage") or {}
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    self.usage[key] += int(usage.get(key) or 0)
+                text = self.parse_response(data)
+                break
+            except ProviderError as exc:
+                last_error = exc
+                if not exc.retryable or attempt >= self.max_attempts:
+                    raise
+                time.sleep(0.8 * attempt)
+        if last_error is not None and not text:
+            raise last_error
+
+        warnings: list[str] = []
+        if not text.strip():
+            warnings.append("GLM-OCR 返回空文本——该文件未被有效入库")
+        if len(text) > self.max_output_chars:
+            text = text[: self.max_output_chars]
+            warnings.append(f"抽取结果超过 {self.max_output_chars} 字符，已截断")
+        return ExtractedText(
+            source=path.name,
+            text=text,
+            extractor=self.name,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            warnings=warnings,
+        )
+
+    def usage_report(self) -> dict[str, Any]:
+        total = self.usage["total_tokens"]
+        return {
+            "calls": self.calls,
+            **dict(self.usage),
+            "avg_tokens_per_image": round(total / self.calls, 1) if self.calls else 0.0,
+        }
+
+
 class StubTextExtractor:
     """离线替身：不联网，按文件名返回预设文本。
 
@@ -461,12 +672,16 @@ class ExtractionOutcome:
 def build_extractor(
     *,
     vision_enabled: bool = False,
+    provider: str = "vlm",
     model: str = "",
     base_url: str = "",
     api_key: str = "",
     prompt: str = "",
     max_tokens: int = 16384,
     max_image_side: int = 0,
+    glm_base_url: str = "https://open.bigmodel.cn",
+    glm_api_key: str = "",
+    glm_model: str = "glm-ocr",
     allow_stub: bool = False,
 ) -> TextExtractor | None:
     """按配置挑图片抽取器。**挑不到就返回 None，而不是偷偷用一个假的。**
@@ -475,6 +690,13 @@ def build_extractor(
     这类静默失效会让"入库了多少内容"这件事无法核对。
     """
 
+    if vision_enabled and provider == "glm-ocr":
+        # 专用文档解析模型：不走 chat/completions，走 /layout_parsing。
+        # 缺 key 时返回 None 而不是"回退到通用 VLM"——**静默换工具会让
+        # 成本与质量都变成另一回事**，而报表上看不出来。
+        if glm_api_key:
+            return GLMOCRExtractor(model=glm_model, base_url=glm_base_url, api_key=glm_api_key)
+        return None
     if vision_enabled and model:
         return VLMTextExtractor(
             model=model,

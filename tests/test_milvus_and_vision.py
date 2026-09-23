@@ -23,8 +23,10 @@ import pytest
 
 from scout.config import MilvusSettings, get_settings
 from scout.data import (
+    GLMOCRExtractor,
     StubTextExtractor,
     VLMTextExtractor,
+    build_extractor,
     extract_document,
     ingest,
     load_documents_with_extraction,
@@ -231,6 +233,91 @@ def test_batch_extraction_records_failures_without_aborting(tmp_path: Path) -> N
     assert len(outcome.documents) == 1
     assert len(outcome.skipped) == 1
     assert "weird.xyz" in outcome.skipped[0]
+
+
+# —— GLM-OCR（专用文档解析模型）——
+
+
+def test_glm_ocr_uses_layout_parsing_endpoint(tmp_path: Path) -> None:
+    """GLM-OCR 走 /layout_parsing，不是 chat/completions。
+
+    端点路径写错会得到 404 或"模型不存在"，容易被误判成"key 没权限"。
+    """
+
+    extractor = GLMOCRExtractor(api_key="k")
+    assert extractor.endpoint() == "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
+
+
+def test_glm_ocr_payload_uses_data_uri(tmp_path: Path) -> None:
+    """官方要求 file 字段是 URL 或 data URI——裸 base64 会被拒。"""
+
+    extractor = GLMOCRExtractor(api_key="k")
+    payload = extractor.build_payload(_make_png(tmp_path))
+    assert payload["model"] == "glm-ocr"
+    assert payload["file"].startswith("data:image/png;base64,")
+
+
+def test_glm_ocr_parses_several_key_shapes() -> None:
+    """字段名不做假设：md_results / markdown / 嵌套 data 都要能认。"""
+
+    assert GLMOCRExtractor(api_key="k").parse_response({"md_results": "# 标题"}) == "# 标题"
+    assert GLMOCRExtractor(api_key="k").parse_response({"markdown": "正文"}) == "正文"
+    assert GLMOCRExtractor(api_key="k").parse_response({"data": {"md": "嵌套"}}) == "嵌套"
+    assert GLMOCRExtractor(api_key="k").parse_response({"md": [{"text": "A"}, {"text": "B"}]}) == "A\nB"
+
+
+def test_glm_ocr_reports_actual_keys_on_schema_miss() -> None:
+    """**这是本类最有用的一条错误信息。**
+
+    字段名猜错的表现是"抽取成功但内容为空"，而"内容为空"又会被上层当成
+    "这篇文档没内容"，最终静默丢数据。所以必须把**真实键名**报出来——
+    让这个问题从"要调试"变成"看一眼就改"。
+    """
+
+    extractor = GLMOCRExtractor(api_key="k")
+    with pytest.raises(ProviderError) as excinfo:
+        extractor.parse_response({"unexpected_field": "x", "another": "y"})
+    message = str(excinfo.value)
+    assert "找不到正文" in message
+    assert "unexpected_field" in message
+    assert excinfo.value.details.get("keys") == ["another", "unexpected_field"]
+
+
+def test_glm_ocr_surfaces_business_error() -> None:
+    """业务错误要如实抛出，不能当成"没有正文"。"""
+
+    with pytest.raises(ProviderError) as excinfo:
+        GLMOCRExtractor(api_key="k").parse_response({"error": {"code": "1210", "message": "参数错误"}})
+    assert "业务错误" in str(excinfo.value)
+    assert "1210" in str(excinfo.value)
+
+
+def test_glm_ocr_end_to_end_with_injected_poster(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def poster(url: str, headers: dict, payload: dict, timeout: float) -> dict:
+        captured["url"] = url
+        captured["auth"] = headers.get("Authorization")
+        return {"md_results": "| 容器 | 端口 |\n| --- | --- |\n| redis | 6379 |", "usage": {"total_tokens": 120}}
+
+    extractor = GLMOCRExtractor(api_key="glm-key", poster=poster)
+    result = extractor.extract(_make_png(tmp_path))
+    assert "redis" in result.text
+    assert captured["url"].endswith("/layout_parsing")
+    assert captured["auth"] == "Bearer glm-key"
+    assert extractor.usage_report()["total_tokens"] == 120
+
+
+def test_build_extractor_selects_provider() -> None:
+    """provider 决定用哪个抽取器；glm-ocr 缺 key 时返回 None 而不是偷偷换一个。"""
+
+    vlm = build_extractor(vision_enabled=True, provider="vlm", model="kimi-k3")
+    assert vlm is not None and isinstance(vlm, VLMTextExtractor)
+
+    glm = build_extractor(vision_enabled=True, provider="glm-ocr", glm_api_key="k")
+    assert isinstance(glm, GLMOCRExtractor)
+
+    assert build_extractor(vision_enabled=True, provider="glm-ocr", glm_api_key="") is None
 
 
 # —— Milvus 集合名与身份隔离 ——

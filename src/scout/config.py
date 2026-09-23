@@ -228,9 +228,18 @@ class VisionSettings:
     """
 
     enabled: bool = False
+    # "vlm"=通用视觉模型（走 chat/completions，兼容 OpenAI 格式）
+    # "glm-ocr"=智谱专用文档解析模型（走 /layout_parsing）
+    # **两者不是同一类工具**：通用 VLM 做 OCR 时 86~96% 的 token 花在推理上，
+    # 而专用 OCR 模型 0.2 元/百万 token、约 1.5 秒/张。选型结论见
+    # evals/results/vision_cost_quality.md。
+    provider: str = "vlm"
     base_url: str = ""
     api_key: str = ""
     model: str = ""
+    glm_base_url: str = "https://open.bigmodel.cn"
+    glm_api_key: str = ""
+    glm_model: str = "glm-ocr"
     max_image_mb: float = 8.0
     max_output_chars: int = 20000
     # 输出预算。**推理模型会先花 token 思考，再输出正文**：
@@ -253,7 +262,8 @@ class VisionSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
-            "model": self.model,
+            "provider": self.provider,
+            "model": self.model or self.glm_model,
             "base_url": self.base_url or "(复用 LLM 配置)",
             "max_image_mb": self.max_image_mb,
             "max_tokens": self.max_tokens,
@@ -420,6 +430,10 @@ class Settings:
             ),
             vision=VisionSettings(
                 enabled=_env_bool("SCOUT_VISION_ENABLED", False),
+                provider=_env_str("SCOUT_OCR_PROVIDER", "vlm"),
+                glm_base_url=_env_str("SCOUT_GLM_BASE_URL", "https://open.bigmodel.cn"),
+                glm_api_key=_env_str("SCOUT_GLM_API_KEY", ""),
+                glm_model=_env_str("SCOUT_GLM_OCR_MODEL", "glm-ocr"),
                 base_url=_env_str("SCOUT_VLM_BASE_URL", ""),
                 api_key=_env_str("SCOUT_VLM_API_KEY", ""),
                 model=_env_str("SCOUT_VLM_MODEL", ""),
