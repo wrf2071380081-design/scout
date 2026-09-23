@@ -744,6 +744,29 @@ def _guess_tags(case: Any) -> list[Any]:
     return tags
 
 
+def _ollama_probe(host: str = "http://127.0.0.1:11434", timeout: float = 2.0) -> dict[str, Any]:
+    """探测本机 Ollama，并列出已拉取的模型。
+
+    **为什么值得单独探测。** 本地部署（Ollama）与云端 MaaS 是两条独立的路：
+    前者零成本但需要本机有运载能力，后者要 key 但要钱。
+    如果只显示"未启用多模态"，使用者无法判断"是没装 Ollama、没拉模型、
+    还是没配环境变量"——这三种情况的修复动作完全不同。
+
+    探测本身不发任何生成请求，**零 token 成本**。
+    """
+
+    import requests
+
+    try:
+        response = requests.get(f"{host.rstrip('/')}/api/tags", timeout=timeout)
+        if not response.ok:
+            return {"running": False, "detail": f"HTTP {response.status_code}"}
+        models = [str(item.get("name")) for item in (response.json().get("models") or [])]
+        return {"running": True, "models": models, "host": host}
+    except Exception as exc:  # noqa: BLE001 - 探测失败不应该是异常路径
+        return {"running": False, "detail": f"{type(exc).__name__}"}
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     """体检：报告当前哪些部件是"真实模型"，哪些还是离线替身。
 
@@ -821,6 +844,13 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 
     # —— 多模态抽取 ——
     provider = settings.vision.provider or "vlm"
+    # 本地 Ollama 探测（零 token 成本，纯 HTTP GET）：
+    # 云端 MaaS 与本地部署是两条独立的路，"未启用"这个提示无法区分
+    # "没装 Ollama / 没拉模型 / 没配环境变量"——三种情况的修法完全不同。
+    ollama = _ollama_probe()
+    ollama_models = list(ollama.get("models") or [])
+    local_ocr = [name for name in ollama_models if "glm-ocr" in name.lower()]
+
     vision_ready = bool(settings.vision.enabled) and (
         bool(settings.vision.glm_api_key) if provider == "glm-ocr" else bool(settings.vision.model)
     )
@@ -833,17 +863,34 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
             print("           成本   : 0.2 元/百万 token（约 1 元/2000 张 A4）")
         else:
             print(f"           模型   : {settings.vision.model}")
-            print(
-                f"           网关   : "
-                f"{urlparse(settings.vision.base_url or settings.llm.base_url).netloc or '(未配置)'}"
-            )
-            print("           提示   : OCR 类任务用专用模型更划算——set SCOUT_OCR_PROVIDER=glm-ocr")
+            target = settings.vision.base_url or settings.llm.base_url
+            print(f"           网关   : {urlparse(target).netloc or target or '(未配置)'}")
+            if "11434" in str(target):
+                print("           模式   : **本机 Ollama（零 token 成本）**")
+            else:
+                print("           提示   : OCR 类任务用专用模型更划算——set SCOUT_OCR_PROVIDER=glm-ocr")
     else:
         if provider == "glm-ocr":
             print("           启用方式: set SCOUT_VISION_ENABLED=1 与 set SCOUT_GLM_API_KEY=<智谱key>")
             print("           获取key : https://open.bigmodel.cn（0.2 元/百万 token）")
         else:
             print("           启用方式: set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
+
+    # —— 本机 Ollama（本地部署路线）——
+    if ollama.get("running"):
+        print(f"[本地Ollama] ✅ 运行中（{ollama.get('host')}，{len(ollama_models)} 个模型）")
+        if ollama_models:
+            preview = ", ".join(ollama_models[:5]) + ("…" if len(ollama_models) > 5 else "")
+            print(f"           已拉取 : {preview}")
+        if local_ocr:
+            print(f"           ✅ 含 OCR 模型 {local_ocr[0]} —— 可直接本地抽取，零 token 成本")
+            print("           启用   : set SCOUT_VISION_ENABLED=1")
+            print("                    set SCOUT_VLM_BASE_URL=http://127.0.0.1:11434/v1")
+            print(f"                    set SCOUT_VLM_MODEL={local_ocr[0]}")
+        else:
+            print("           拉取   : ollama pull glm-ocr")
+    else:
+        print(f"[本地Ollama] ⚪ 未运行（{ollama.get('detail', '未安装')}）")
 
     # —— 可选依赖 ——
     print("[依赖]")
