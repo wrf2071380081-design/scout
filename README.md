@@ -25,9 +25,15 @@ scout 不只是"能回答问题的 RAG"。它按 **三层** 组织成一个完�
 | 运行时后端 | 实现 | 何时用 |
 |---|---|---|
 | 状态存储 | 内存 / 文件 JSONL / **Redis** | 单进程演示 / 本地可恢复 / 多副本与跨进程 |
+| **向量索引** | 内存（精确暴力） / **Milvus（HNSW，可选）** | 离线复现与消融 / 生产形态与规模 |
 | 向量器 | 哈希（离线基线） / 本地语义（fastembed + BGE） / OpenAI 兼容 | 离线复现 / 无需 key 的语义检索 / 已有网关 |
 | 重排器 | 词法（离线基线） / **cross-encoder（bge-reranker）** | 基线对照 / 真实精度 |
 | LLM | 离线启发式 / OpenAI 兼容（含流式） | 可复现断言 / 真实回答 |
+| **图片抽取** | 不支持 / **VLM（OpenAI 兼容视觉消息）** | 纯文本语料 / 扫描件与图表入库 |
+
+**向量索引两种后端由同一个入口构造**（`build_index(milvus=...)`），
+所以"换后端前后指标是否一致"是一个可以验证的问题，而不是一句声称。
+`scout milvus-smoke` 会量化两者的 top-k 重合度——**那其实就是 HNSW 的近似召回损失**。
 
 ```bash
 git clone <this-repo> && cd scout
@@ -42,6 +48,8 @@ scout ingest        # 跑一遍入库流水线：版面还原/切分/去重/版�
 scout stack         # 展示运行时链装配顺序，并现场验证缓存命中不花钱
 scout judge-compare # LLM 裁判 vs 词法归因校验的对照（含不一致清单）
 scout flywheel      # 数据飞轮：观测 → 挖掘 → 复核 → 评测集增量
+scout ingest --images  # 把图片/扫描件也纳入入库（走视觉模型抽取 → 同一条流水线）
+scout milvus-smoke  # Milvus 联机冒烟：连通性 + 与内存精确检索的重合度（ANN 召回）
 scout serve         # 启动 Web 控制台（链路透视 + 审批台 + SSE 流式问答）
 scout mcp           # 以 MCP Server 运行，供任意 Agent 客户端接入
 ```

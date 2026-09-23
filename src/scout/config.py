@@ -186,6 +186,69 @@ class VerifySettings:
 
 
 @dataclass(frozen=True, slots=True)
+class MilvusSettings:
+    """Milvus 向量后端配置。
+
+    默认**关闭**：内存索引是评测与消融能"克隆即可离线复现"的前提。
+    Milvus 是**生产形态与能力证明**——开启后同一套评测可以跑在真实向量库上。
+
+    :param require_sync: ``True`` 时 Milvus 不可用直接报错，拒绝降级。
+        出评测报告时应当打开：否则指标可能来自内存兜底，而报告上看不出来。
+    """
+
+    enabled: bool = False
+    uri: str = "http://127.0.0.1:19530"
+    token: str = ""
+    collection_prefix: str = "scout"
+    index_type: str = "HNSW"
+    metric_type: str = "COSINE"
+    timeout_seconds: float = 10.0
+    require_sync: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "uri": self.uri,
+            "collection_prefix": self.collection_prefix,
+            "index_type": self.index_type,
+            "metric_type": self.metric_type,
+            "require_sync": self.require_sync,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VisionSettings:
+    """图片/扫描件抽取（OCR / VLM）配置。
+
+    ``base_url`` / ``api_key`` 留空时复用 ``LLMSettings`` 的值——
+    同一个 OpenAI 兼容网关通常同时提供文本与视觉模型，没必要配两遍。
+
+    :param model: 视觉模型名。**留空等于没开**：把图片发给一个纯文本模型
+        不会报错，只会得到一段胡编的描述，那比不抽取更糟。
+    """
+
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    max_image_mb: float = 8.0
+    max_output_chars: int = 20000
+    prompt: str = (
+        "请把这张图片中的全部文字逐字提取出来，保持原有的阅读顺序与段落结构。"
+        "表格请用 Markdown 表格还原，并保留表头。"
+        "只输出内容本身，不要添加任何解释、总结或前后缀。"
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "model": self.model,
+            "base_url": self.base_url or "(复用 LLM 配置)",
+            "max_image_mb": self.max_image_mb,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class IntentSettings:
     """意图漏斗配置。
 
@@ -248,6 +311,8 @@ class Settings:
     verify: VerifySettings = field(default_factory=VerifySettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     intent: IntentSettings = field(default_factory=IntentSettings)
+    milvus: MilvusSettings = field(default_factory=MilvusSettings)
+    vision: VisionSettings = field(default_factory=VisionSettings)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -329,6 +394,23 @@ class Settings:
                 margin_threshold=_env_float("SCOUT_INTENT_MARGIN_THRESHOLD", 0.15),
                 sensitive_labels=_env_list("SCOUT_INTENT_SENSITIVE"),
                 short_circuit_labels=_env_list("SCOUT_INTENT_SHORT_CIRCUIT", ("闲聊", "越界")),
+            ),
+            milvus=MilvusSettings(
+                enabled=_env_bool("SCOUT_MILVUS_ENABLED", False),
+                uri=_env_str("SCOUT_MILVUS_URI", "http://127.0.0.1:19530"),
+                token=_env_str("SCOUT_MILVUS_TOKEN", ""),
+                collection_prefix=_env_str("SCOUT_MILVUS_PREFIX", "scout"),
+                index_type=_env_str("SCOUT_MILVUS_INDEX_TYPE", "HNSW"),
+                metric_type=_env_str("SCOUT_MILVUS_METRIC", "COSINE"),
+                timeout_seconds=_env_float("SCOUT_MILVUS_TIMEOUT", 10.0, minimum=0.1),
+                require_sync=_env_bool("SCOUT_MILVUS_REQUIRE_SYNC", False),
+            ),
+            vision=VisionSettings(
+                enabled=_env_bool("SCOUT_VISION_ENABLED", False),
+                base_url=_env_str("SCOUT_VLM_BASE_URL", ""),
+                api_key=_env_str("SCOUT_VLM_API_KEY", ""),
+                model=_env_str("SCOUT_VLM_MODEL", ""),
+                max_image_mb=_env_float("SCOUT_VLM_MAX_IMAGE_MB", 8.0, minimum=0.1),
             ),
         )
 

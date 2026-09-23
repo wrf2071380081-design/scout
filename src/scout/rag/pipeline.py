@@ -630,6 +630,9 @@ def build_index(
     settings: Settings | None = None,
     embedder: Any = None,
     embed_backend: str = "auto",
+    milvus: bool | None = None,
+    corpus_key: str = "",
+    strict: bool | None = None,
 ) -> HybridIndex:
     """便捷构造：``documents`` 为 ``[(filename, text), ...]``。
 
@@ -640,15 +643,37 @@ def build_index(
     （``auto`` 会在装了 fastembed 时启用本地语义向量模型）。
     注意：单元测试传的是显式 embedder 或默认 ``auto``——
     而 ``auto`` 在没有 fastembed 的环境里退回哈希向量器，因此测试保持确定性。
+
+    :param milvus: ``None`` 时读配置（``SCOUT_MILVUS_ENABLED``）；
+        ``True`` 强制走 Milvus 后端，``False`` 强制内存。
+        **两种后端必须由同一个入口构造**，否则"两种后端的指标可对比"
+        这件事就没有保障——它们可能连分块方式都不一样。
+    :param corpus_key: 语料身份，用于派生 Milvus 集合名。留空时用语料内容指纹。
+    :param strict: 是否拒绝从 Milvus 降级到内存。出评测报告时应当为 True。
     """
 
     from .embed import default_embedder
 
     effective = settings or get_settings()
-    index = HybridIndex(
-        embedder=embedder or default_embedder(effective, backend=embed_backend),
-        settings=effective.retrieval,
-    )
+    active_embedder = embedder or default_embedder(effective, backend=embed_backend)
+    use_milvus = effective.milvus.enabled if milvus is None else milvus
+    index: HybridIndex
+    if use_milvus:
+        from .milvus_store import MilvusHybridIndex
+
+        # 惰性导入：evaluation 包会反向依赖 rag，顶层导入会形成包级循环
+        from ..evaluation.dataset import corpus_fingerprint
+
+        index = MilvusHybridIndex(
+            embedder=active_embedder,
+            settings=effective.retrieval,
+            milvus=effective.milvus,
+            corpus_key=corpus_key or corpus_fingerprint(documents),
+            strict=strict,
+        )
+    else:
+        index = HybridIndex(embedder=active_embedder, settings=effective.retrieval)
+
     for position, (filename, text) in enumerate(documents):
         index.add_document(
             text,

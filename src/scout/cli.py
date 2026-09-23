@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -367,15 +368,59 @@ def cmd_intent(args: argparse.Namespace) -> int:
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
-    """跑一遍入库流水线（版面还原 → 切分 → 去重 → 版本），只打报告不写库。"""
+    """跑一遍入库流水线（版面还原 → 切分 → 去重 → 版本），只打报告不写库。
 
-    from .data import ingest
+    支持图片/扫描件：``--images`` 让目录里的图片走视觉模型抽取文本，
+    抽取结果与文本文件走**同一条**入库流水线——
+    多模态不是旁路，只是入库入口多了一种输入形态。
+    """
+
+    from .data import ingest, load_documents_with_extraction
+    from .data.extract import IMAGE_SUFFIXES, TEXT_SUFFIXES, build_extractor
 
     directory = Path(args.corpus)
     if not directory.exists():
         print(f"语料目录不存在：{directory}")
         return 1
-    documents = load_corpus(directory, max_files=args.limit or None)
+
+    settings = get_settings()
+    documents: list[tuple[str, str]] = []
+    extraction_report: dict[str, object] | None = None
+
+    if args.images:
+        extractor = build_extractor(
+            vision_enabled=settings.vision.enabled,
+            model=settings.vision.model,
+            base_url=settings.vision.base_url or settings.llm.base_url,
+            api_key=settings.vision.api_key or settings.llm.api_key,
+            prompt=settings.vision.prompt,
+        )
+        if extractor is None:
+            print("已指定 --images，但没有可用的视觉抽取器。")
+            print("请设置：set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
+            print("（也可以用 SCOUT_VLM_BASE_URL / SCOUT_VLM_API_KEY 指定独立网关）")
+            return 1
+        suffixes = TEXT_SUFFIXES | IMAGE_SUFFIXES
+        files = sorted(
+            path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in suffixes
+        )
+        if args.limit:
+            files = files[: args.limit]
+        print(f"抽取器：{extractor.name}（模型 {settings.vision.model}）")
+        outcome = load_documents_with_extraction(files, image_extractor=extractor)
+        documents = outcome.documents
+        extraction_report = outcome.to_dict()
+        print(f"抽取完成：成功 {len(documents)} 篇｜失败 {len(outcome.skipped)} 篇")
+        for item in outcome.extracted[:5]:
+            print(f"  - {item['source']}（{item['extractor']}，{item['chars']} 字，{item['duration_ms']}ms）")
+        for skipped in outcome.skipped[:5]:
+            print(f"  ✗ {skipped}")
+        for warning in outcome.warnings[:5]:
+            print(f"  ! {warning}")
+        print()
+    else:
+        documents = load_corpus(directory, max_files=args.limit or None)
+
     sections, report, registry = ingest(documents)
 
     print(f"入库流水线：{directory}")
@@ -408,11 +453,35 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     print()
     print(f"版本登记：{len(list(registry.active()))} 个活跃文档")
     if args.out:
+        payload: dict[str, object] = report.to_dict()
+        if extraction_report is not None:
+            payload["extraction"] = extraction_report
         Path(args.out).write_text(
-            json.dumps(report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"报告已写入 {args.out}")
     return 0
+
+
+def cmd_milvus_smoke(args: argparse.Namespace) -> int:
+    """对运行中的 Milvus 做一次联机冒烟：连通性 + 与内存精确检索的重合度。"""
+
+    import subprocess
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "milvus_smoke.py"
+    if not script.exists():
+        print(f"未找到冒烟脚本：{script}")
+        return 1
+    env = dict(os.environ)
+    if args.uri:
+        env["SCOUT_MILVUS_URI"] = args.uri
+    env["SMOKE_DOCS"] = str(args.docs)
+    env["SMOKE_TOP_K"] = str(args.top_k)
+    print(f"运行 {script.name}（Milvus {args.uri or '默认 127.0.0.1:19530'}）…")
+    completed = subprocess.run(  # noqa: S603 - 本仓库自带脚本
+        [sys.executable, str(script)], env=env, check=False
+    )
+    return int(completed.returncode)
 
 
 def cmd_stack(args: argparse.Namespace) -> int:
@@ -706,12 +775,45 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     if not musique.exists():
         print("           下载: 见 scripts/bench_musique.py 顶部说明")
 
+    # —— 向量库后端（内存 / Milvus）——
+    if settings.milvus.enabled:
+        from .rag.milvus_store import MilvusDenseStore
+
+        store = MilvusDenseStore(
+            uri=settings.milvus.uri,
+            token=settings.milvus.token,
+            prefix=settings.milvus.collection_prefix,
+            timeout=min(settings.milvus.timeout_seconds, 3.0),
+        )
+        reachable = store.ping()
+        print(f"[向量库]   {'✅ Milvus' if reachable else '❌ Milvus 不可达 → 会降级回内存'}")
+        print(f"           地址   : {settings.milvus.uri}（{settings.milvus.index_type} / {settings.milvus.metric_type}）")
+        if reachable:
+            print(f"           集合前缀: {settings.milvus.collection_prefix}_<语料指纹>")
+            print(f"           拒降级 : {'是（strict，指标必然来自 Milvus）' if settings.milvus.require_sync else '否（不可用时回退内存并留痕）'}")
+        else:
+            print(f"           失败原因: {store.last_error or '未知'}")
+            print("           启动方式: docker start milvus-etcd milvus-minio milvus-standalone")
+    else:
+        print("[向量库]   ⚪ 内存索引（精确暴力检索，评测可离线复现）")
+        print("           启用 Milvus: set SCOUT_MILVUS_ENABLED=1  然后 scout milvus-smoke")
+
+    # —— 多模态抽取 ——
+    vision_ready = bool(settings.vision.enabled and settings.vision.model)
+    print(f"[多模态]   {'✅ 图片抽取（视觉模型）' if vision_ready else '⚪ 未启用（只处理文本文件）'}")
+    if vision_ready:
+        print(f"           模型   : {settings.vision.model}")
+        print(f"           网关   : {urlparse(settings.vision.base_url or settings.llm.base_url).netloc or '(未配置)'}")
+    else:
+        print("           启用方式: set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
+
     # —— 可选依赖 ——
     print("[依赖]")
     for module, hint in [
         ("requests", "LLM/向量 HTTP 调用"),
         ("pydantic", "结构化输出解析"),
         ("fastembed", "本地语义向量（可选）"),
+        ("pymilvus", "Milvus 向量库后端（可选）"),
         ("pytest", "测试（可选）"),
     ]:
         try:
@@ -777,7 +879,18 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--corpus", default=DEFAULT_CORPUS, help="语料目录")
     ingest.add_argument("--limit", type=int, default=0, help="最多读多少个文件（0=全部）")
     ingest.add_argument("--out", default="", help="把报告写成 JSON")
+    ingest.add_argument(
+        "--images",
+        action="store_true",
+        help="把图片/扫描件也纳入（走视觉模型抽取后进同一条流水线）",
+    )
     ingest.set_defaults(func=cmd_ingest)
+
+    milvus = sub.add_parser("milvus-smoke", help="Milvus 联机冒烟：连通性 + 与内存精确检索的重合度")
+    milvus.add_argument("--uri", default="", help="覆盖 SCOUT_MILVUS_URI")
+    milvus.add_argument("--docs", type=int, default=8, help="语料篇数")
+    milvus.add_argument("--top-k", type=int, default=10, help="检索深度")
+    milvus.set_defaults(func=cmd_milvus_smoke)
 
     stack = sub.add_parser("stack", help="展示运行时链装配顺序（缓存/预算/路由）并做最小验证")
     stack.add_argument("--query", default="判一下这段证据够不够", help="用于演示的请求内容")
