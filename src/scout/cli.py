@@ -820,13 +820,30 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         print("           启用 Milvus: set SCOUT_MILVUS_ENABLED=1  然后 scout milvus-smoke")
 
     # —— 多模态抽取 ——
-    vision_ready = bool(settings.vision.enabled and settings.vision.model)
-    print(f"[多模态]   {'✅ 图片抽取（视觉模型）' if vision_ready else '⚪ 未启用（只处理文本文件）'}")
+    provider = settings.vision.provider or "vlm"
+    vision_ready = bool(settings.vision.enabled) and (
+        bool(settings.vision.glm_api_key) if provider == "glm-ocr" else bool(settings.vision.model)
+    )
+    label = "GLM-OCR（专用文档解析）" if provider == "glm-ocr" else "通用视觉模型（VLM）"
+    print(f"[多模态]   {'✅ 图片抽取 · ' + label if vision_ready else '⚪ 未启用（只处理文本文件）'}")
     if vision_ready:
-        print(f"           模型   : {settings.vision.model}")
-        print(f"           网关   : {urlparse(settings.vision.base_url or settings.llm.base_url).netloc or '(未配置)'}")
+        if provider == "glm-ocr":
+            print(f"           模型   : {settings.vision.glm_model}")
+            print(f"           网关   : {settings.vision.glm_base_url}")
+            print("           成本   : 0.2 元/百万 token（约 1 元/2000 张 A4）")
+        else:
+            print(f"           模型   : {settings.vision.model}")
+            print(
+                f"           网关   : "
+                f"{urlparse(settings.vision.base_url or settings.llm.base_url).netloc or '(未配置)'}"
+            )
+            print("           提示   : OCR 类任务用专用模型更划算——set SCOUT_OCR_PROVIDER=glm-ocr")
     else:
-        print("           启用方式: set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
+        if provider == "glm-ocr":
+            print("           启用方式: set SCOUT_VISION_ENABLED=1 与 set SCOUT_GLM_API_KEY=<智谱key>")
+            print("           获取key : https://open.bigmodel.cn（0.2 元/百万 token）")
+        else:
+            print("           启用方式: set SCOUT_VISION_ENABLED=1 与 set SCOUT_VLM_MODEL=<视觉模型名>")
 
     # —— 可选依赖 ——
     print("[依赖]")
